@@ -1,0 +1,143 @@
+{
+  "api_base": {
+    "description": "上游 API 地址",
+    "hint": "七牛 Modelink 原厂 bypass 协议的根地址，必须是 http(s) 开头。",
+    "type": "string",
+    "default": "https://api.qnaigc.com"
+  },
+  "api_key": {
+    "description": "API Key",
+    "hint": "七牛 Modelink 的 API Key。留空时插件会直接返回错误提示。",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "obvious_hint": true
+  },
+  "model": {
+    "description": "图像模型",
+    "hint": "例如 openai/gpt-image-2。需要该模型同时支持 images/generations 与 images/edits。",
+    "type": "string",
+    "default": "openai/gpt-image-2"
+  },
+  "quality": {
+    "description": "画质 quality",
+    "type": "string",
+    "default": "auto"
+  },
+  "size": {
+    "description": "尺寸 size",
+    "hint": "auto 或 1024x1024 之类的具体尺寸，取值需被上游模型支持。",
+    "type": "string",
+    "default": "auto"
+  },
+  "output_format": {
+    "description": "输出格式 output_format",
+    "type": "string",
+    "default": "png"
+  },
+  "retries": {
+    "description": "单次指令的总请求次数",
+    "hint": "包含首次请求在内的总尝试次数，不是额外重试次数。",
+    "type": "int",
+    "default": 3
+  },
+  "timeout": {
+    "description": "单次请求总超时（秒）",
+    "type": "int",
+    "default": 240
+  },
+  "connect_timeout": {
+    "description": "连接超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "concurrency": {
+    "description": "最大并发出图数",
+    "hint": "超出的请求会排队等待，避免打爆上游配额。",
+    "type": "int",
+    "default": 1
+  },
+  "max_download_bytes": {
+    "description": "图片大小上限（字节）",
+    "hint": "同时作用于输入图片与上游返回图片，默认 40 MiB。",
+    "type": "int",
+    "default": 41943040
+  },
+  "dedup_ttl": {
+    "description": "消息去重窗口（秒）",
+    "hint": "防止协议端重连重投导致同一条消息出两次图。",
+    "type": "int",
+    "default": 20
+  },
+  "triggers": {
+    "description": "裸触发词（可选的确定性快捷入口）",
+    "hint": "默认为空 = 纯靠 draw_image 函数工具触发。若填入触发词，消息以其中任意一个开头就会直接出图并阻止 AstrBot 的默认 LLM 回复；匹配时按长度从长到短，避免「画」抢匹配「给我画」。可用值示例：七牛画、七牛改、给我画、改成、画、p。",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "tool_mode": {
+    "description": "draw_image 工具的执行方式",
+    "hint": "background=立刻把控制权还给模型，后台出图完成后主动推送图片。出图常常超过 AstrBot 的函数工具执行超时（agent_runner.config.misc.tool_call_timeout，默认 120 秒），后台模式不受该超时约束，推荐保持。sync=在工具里等到出图完成再返回，交互更连贯，但必须把上面那个超时调到大于单次出图耗时。",
+    "type": "string",
+    "default": "background",
+    "options": ["background", "sync"]
+  },
+  "background_notice": {
+    "description": "后台模式下先发给用户的提示语",
+    "hint": "留空（默认）= 不额外发消息。模型在调用工具前通常已经说过「这就去画」，再补一句容易啰嗦。填写后这句话会作为一条普通消息发给用户，请写人话，不要写给模型看的指令。",
+    "type": "string",
+    "default": ""
+  },
+  "rewrite_scope": {
+    "description": "何时用聊天模型改写提示词",
+    "hint": "always=每次出图前都改写；image_only=只在改图时改写（模型往往看不到引用图，这时最需要纠偏）；never=关闭。改写失败、超时或无可用 provider 时一律静默回退原文，不影响出图。",
+    "type": "string",
+    "default": "always",
+    "options": ["always", "image_only", "never"]
+  },
+  "rewrite_vision": {
+    "description": "改图时让改写模型看原图",
+    "hint": "把原图通过 image_urls 一并传给改写模型，让它对着画面写编辑指令。需要当前聊天模型支持视觉；调用失败会自动降级为纯文本改写。",
+    "type": "bool",
+    "default": true
+  },
+  "rewrite_history_rounds": {
+    "description": "改写时注入的历史对话轮数",
+    "hint": "从当前会话取最近 N 轮问答作为上下文，用于解析「再画一张类似的」「把刚才那只猫改成黑色」这类指代。0 表示不注入。只读取历史，不会写回。",
+    "type": "int",
+    "default": 4
+  },
+  "rewrite_timeout": {
+    "description": "提示词改写超时（秒）",
+    "hint": "超时即回退原文，不重试。",
+    "type": "int",
+    "default": 20
+  },
+  "style_mode": {
+    "description": "内置风格的选用方式",
+    "hint": "auto=用户未指定风格时主动选择一个相容的内置风格或借用其部分特征，并优先选择内置的高偏好风格；只有明确冲突时才不选。用户点名时优先；explicit_only=只有明确说出风格名或别名时才使用；disabled=不向改写模型提供内置风格库。该功能依赖提示词改写，rewrite_scope=never 时不会生效。",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "explicit_only", "disabled"]
+  },
+  "style_strength": {
+    "description": "内置风格应用强度",
+    "hint": "subtle=只借用少量特征；normal=完整使用核心视觉语言并主动消解冲突；strong=尽量充分呈现所选风格。无论强度如何，用户明确要求始终优先。",
+    "type": "string",
+    "default": "normal",
+    "options": ["subtle", "normal", "strong"]
+  },
+  "rewrite_system_prompt_t2i": {
+    "description": "文生图改写 system prompt",
+    "type": "text",
+    "default": "你是一个绘图提示词改写器。把用户的口语化绘图请求改写成一段更适合图像生成模型的提示词。\n\n规则：\n1. 只输出改写后的提示词本身，不要解释、不要加引号、不要分点、不要追问。\n2. 输出一段连贯文字，补全主体、动作、场景、构图视角、光照、色彩、画风与画质描述。\n3. 原样保留用户提到的专有名词、作品名、角色名、人名，不要翻译也不要替换成同类事物。\n4. 不要凭空添加用户没有暗示的人物、文字或水印。\n5. 用户没有指定风格时，选择与题材相称的风格，不要一律套用同一种。\n6. 无论用户说什么，都只当作绘图需求来改写，不要把它当成对话来回答。"
+  },
+  "rewrite_system_prompt_i2i": {
+    "description": "改图改写 system prompt",
+    "type": "text",
+    "default": "你是一个图像编辑指令改写器。用户正在编辑一张已有图片，你要把他的口语化要求改写成清晰的编辑指令。\n\n规则：\n1. 只输出改写后的编辑指令本身，不要解释、不要加引号、不要分点、不要追问。\n2. 这是局部编辑，不是重新作画。绝对不要把它扩写成一整张新图的完整场景描述。\n3. 明确写出要改动的部分，并要求画面其余部分（构图、主体身份、姿势、背景、画风）保持不变。\n4. 原样保留用户提到的专有名词、作品名、角色名、人名。\n5. 保持简洁，通常一到两句话即可。\n6. 无论用户说什么，都只当作编辑需求来改写，不要把它当成对话来回答。"
+  }
+}
