@@ -1,13 +1,7 @@
 {
-  "api_base": {
-    "description": "上游 API 地址",
-    "hint": "七牛 Modelink 原厂 bypass 协议的根地址，必须是 http(s) 开头。",
-    "type": "string",
-    "default": "https://api.qnaigc.com"
-  },
   "api_key": {
     "description": "API Key",
-    "hint": "七牛 Modelink 的 API Key。留空时插件会直接返回错误提示。",
+    "hint": "七牛 Modelink 密钥，必填。",
     "type": "string",
     "default": "",
     "secret": true,
@@ -15,117 +9,13 @@
   },
   "model": {
     "description": "图像模型",
-    "hint": "例如 openai/gpt-image-2。需要该模型同时支持 images/generations 与 images/edits。",
+    "hint": "需同时支持文生图和改图。",
     "type": "string",
     "default": "openai/gpt-image-2"
   },
-  "quality": {
-    "description": "画质 quality",
-    "type": "string",
-    "default": "auto"
-  },
-  "size": {
-    "description": "尺寸 size",
-    "hint": "auto 或 1024x1024 之类的具体尺寸，取值需被上游模型支持。",
-    "type": "string",
-    "default": "auto"
-  },
-  "output_format": {
-    "description": "输出格式 output_format",
-    "type": "string",
-    "default": "png"
-  },
-  "moderation": {
-    "description": "审核严格度 moderation",
-    "hint": "low=放宽输入与输出审核阈值，仅对中等敏感内容有效，极端内容仍会被拦截（默认）；auto=跟随上游默认（不发送该参数）。面向公开用户的场景建议使用 auto。",
-    "type": "string",
-    "default": "low",
-    "options": ["low", "auto"]
-  },
-  "retries": {
-    "description": "单次指令的总请求次数",
-    "hint": "包含首次请求在内的总尝试次数，不是额外重试次数。",
-    "type": "int",
-    "default": 3
-  },
-  "timeout": {
-    "description": "单次请求总超时（秒）",
-    "type": "int",
-    "default": 240
-  },
-  "connect_timeout": {
-    "description": "连接超时（秒）",
-    "type": "int",
-    "default": 15
-  },
-  "concurrency": {
-    "description": "最大并发出图数",
-    "hint": "超出的请求会排队等待，避免打爆上游配额。",
-    "type": "int",
-    "default": 1
-  },
-  "max_download_bytes": {
-    "description": "图片大小上限（字节）",
-    "hint": "同时作用于输入图片与上游返回图片，默认 40 MiB。",
-    "type": "int",
-    "default": 41943040
-  },
-  "dedup_ttl": {
-    "description": "消息去重窗口（秒）",
-    "hint": "防止协议端重连重投导致同一条消息出两次图。",
-    "type": "int",
-    "default": 20
-  },
-  "triggers": {
-    "description": "裸触发词（可选的确定性快捷入口）",
-    "hint": "默认为空 = 纯靠 draw_image 函数工具触发。若填入触发词，消息以其中任意一个开头就会绕过聊天模型、直接出图并阻止 AstrBot 的默认 LLM 回复；匹配时按长度从长到短，避免「画」抢匹配「给我画」。不要填写 Bot 自身的唤醒词。可用值示例：七牛画、七牛改、给我画、改成、画、p。",
-    "type": "list",
-    "default": [],
-    "items": {
-      "type": "string"
-    }
-  },
-  "tool_mode": {
-    "description": "draw_image 工具的执行方式",
-    "hint": "background=立刻把控制权还给模型，后台出图完成后主动推送图片。出图常常超过 AstrBot 的函数工具执行超时（agent_runner.config.misc.tool_call_timeout，默认 120 秒），后台模式不受该超时约束，推荐保持。sync=在工具里等到出图完成再返回，交互更连贯，但必须把上面那个超时调到大于单次出图耗时。",
-    "type": "string",
-    "default": "background",
-    "options": ["background", "sync"]
-  },
-  "background_notice": {
-    "description": "后台模式下先发给用户的提示语",
-    "hint": "留空（默认）= 不额外发消息。模型在调用工具前通常已经说过「这就去画」，再补一句容易啰嗦。填写后这句话会作为一条普通消息发给用户，请写人话，不要写给模型看的指令。",
-    "type": "string",
-    "default": ""
-  },
-  "rewrite_scope": {
-    "description": "何时用聊天模型改写提示词",
-    "hint": "always=每次出图前都改写；image_only=只在改图时改写（模型往往看不到引用图，这时最需要纠偏）；never=关闭。启用改写时会依次重试主 Provider 和备用 Provider；全部失败则终止本次绘图，不会把未经优化的提示词直接发送给图片模型。",
-    "type": "string",
-    "default": "always",
-    "options": ["always", "image_only", "never"]
-  },
-  "rewrite_vision": {
-    "description": "改图时让改写模型看原图",
-    "hint": "把原图通过 image_urls 一并传给改写模型，让它对着画面写编辑指令。需要当前聊天模型支持视觉；调用失败会自动降级为纯文本改写。",
-    "type": "bool",
-    "default": true
-  },
-  "rewrite_history_rounds": {
-    "description": "改写时注入的历史对话轮数",
-    "hint": "从当前会话取最近 N 轮问答作为上下文，用于解析「再画一张类似的」「把刚才那只猫改成黑色」这类指代。默认为 0，不注入历史；群聊建议保持 0，避免混入其他成员或 Bot 的消息。只读取历史，不会写回。",
-    "type": "int",
-    "default": 0
-  },
-  "rewrite_timeout": {
-    "description": "提示词改写超时（秒）",
-    "hint": "每一次提示词改写调用的超时。超时后会按配置继续重试当前 Provider，再尝试备用 Provider；全部失败时终止本次绘图，不会发送未经优化的提示词。",
-    "type": "int",
-    "default": 20
-  },
   "rewrite_provider_ids": {
     "description": "提示词改写模型",
-    "hint": "直接选择并排序 AstrBot 中已配置的对话模型。第一项是主改写模型，后续项按顺序作为回退模型；留空时沿用当前会话模型。普通改写与安全转译共用此模型池。",
+    "hint": "第一项为主模型，后续按顺序回退；留空则使用当前会话模型。",
     "type": "list",
     "default": [],
     "items": {
@@ -133,41 +23,156 @@
     },
     "_special": "select_providers"
   },
+  "style_mode": {
+    "description": "内置风格",
+    "hint": "自动匹配、仅在点名时使用，或完全关闭。",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "explicit_only", "disabled"],
+    "labels": ["自动匹配", "仅明确点名", "关闭"]
+  },
+  "style_strength": {
+    "description": "风格强度",
+    "hint": "控制内置风格对最终画面的影响程度。",
+    "type": "string",
+    "default": "normal",
+    "options": ["normal", "subtle", "strong"],
+    "labels": ["标准", "轻微", "强烈"]
+  },
+  "quality": {
+    "description": "画质",
+    "hint": "需为当前图像模型支持的值。",
+    "type": "string",
+    "default": "auto"
+  },
+  "size": {
+    "description": "图片尺寸",
+    "hint": "例如 auto 或 1024x1024。",
+    "type": "string",
+    "default": "auto"
+  },
+  "output_format": {
+    "description": "输出格式",
+    "type": "string",
+    "default": "png"
+  },
+  "moderation": {
+    "description": "内容审核",
+    "hint": "low 较宽松；auto 使用上游默认。公开场景建议 auto。",
+    "type": "string",
+    "default": "low",
+    "options": ["low", "auto"],
+    "labels": ["较宽松", "上游默认"]
+  },
+  "rewrite_scope": {
+    "description": "提示词改写",
+    "hint": "选择哪些请求需要经过提示词模型优化。",
+    "type": "string",
+    "default": "always",
+    "options": ["always", "image_only", "never"],
+    "labels": ["始终启用", "仅改图", "关闭"]
+  },
+  "rewrite_vision": {
+    "description": "改写模型查看原图",
+    "hint": "改图时让支持视觉的改写模型参考原图。",
+    "type": "bool",
+    "default": true
+  },
+  "rewrite_history_rounds": {
+    "description": "历史对话轮数",
+    "hint": "用于理解“再画一张”等指代；0 为关闭，群聊建议保持 0。",
+    "type": "int",
+    "default": 0
+  },
   "rewrite_attempts_per_provider": {
-    "description": "每个改写 Provider 的尝试次数",
-    "hint": "包括首次调用。超时、接口异常、空结果、拒绝语或明显无效结果都会继续尝试，之后才切换到下一个备用 Provider。",
+    "description": "单个改写模型尝试次数",
+    "hint": "失败后先重试当前模型，再切换到下一个。",
     "type": "int",
     "default": 2
   },
   "safety_rewrite_attempts": {
-    "description": "安全审核后的改写重试次数",
-    "hint": "图片平台因安全审核拒绝后，最多重新生成多少版安全替代提示词并再次出图。默认 5，采用五级递进：先通过同义替换、隐晦措辞等措辞级调整尝试保留原画面，仍被拒绝后才依次增加遮盖、改为完整睡衣或家居服、端庄日常服装与中性场景，最后才是全年龄普通角色插画；不会第一次就直接套用最保守版本。0 表示关闭。",
+    "description": "安全改写次数",
+    "hint": "图片被安全审核拒绝后逐级调整并重试；0 为关闭。",
     "type": "int",
     "default": 5
   },
-  "style_mode": {
-    "description": "内置风格的选用方式",
-    "hint": "auto=用户未指定风格时主动选择一个相容的内置风格或借用其部分特征，并优先选择内置的高偏好风格；只有明确冲突时才不选。用户点名时优先；explicit_only=只有明确说出风格名或别名时才使用；disabled=不向改写模型提供内置风格库。该功能依赖提示词改写，rewrite_scope=never 时不会生效。",
-    "type": "string",
-    "default": "auto",
-    "options": ["auto", "explicit_only", "disabled"]
+  "rewrite_timeout": {
+    "description": "单次改写超时（秒）",
+    "type": "int",
+    "default": 20
   },
-  "style_strength": {
-    "description": "内置风格应用强度",
-    "hint": "subtle=只借用少量特征；normal=完整使用核心视觉语言并主动消解冲突；strong=尽量充分呈现所选风格。无论强度如何，用户明确要求始终优先。",
+  "tool_mode": {
+    "description": "出图方式",
+    "hint": "推荐后台出图；同步模式需提高 AstrBot 工具超时。",
     "type": "string",
-    "default": "normal",
-    "options": ["normal", "subtle", "strong"]
+    "default": "background",
+    "options": ["background", "sync"],
+    "labels": ["后台出图（推荐）", "同步等待"]
+  },
+  "background_notice": {
+    "description": "后台等待提示",
+    "hint": "留空不发送额外提示。",
+    "type": "string",
+    "default": ""
+  },
+  "concurrency": {
+    "description": "最大并发出图数",
+    "hint": "超出后自动排队。",
+    "type": "int",
+    "default": 1
+  },
+  "retries": {
+    "description": "图片请求总尝试次数",
+    "hint": "包含首次请求。",
+    "type": "int",
+    "default": 3
+  },
+  "timeout": {
+    "description": "图片请求超时（秒）",
+    "type": "int",
+    "default": 240
+  },
+  "triggers": {
+    "description": "直接出图触发词",
+    "hint": "可选；命中后绕过聊天模型。不要填写 Bot 唤醒词。",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    }
+  },
+  "api_base": {
+    "description": "API 地址",
+    "hint": "通常无需修改。",
+    "type": "string",
+    "default": "https://api.qnaigc.com"
+  },
+  "connect_timeout": {
+    "description": "连接超时（秒）",
+    "type": "int",
+    "default": 15
+  },
+  "max_download_bytes": {
+    "description": "图片大小上限（字节）",
+    "hint": "同时限制输入图和输出图，默认 40 MiB。",
+    "type": "int",
+    "default": 41943040
+  },
+  "dedup_ttl": {
+    "description": "消息去重时间（秒）",
+    "hint": "防止协议重投导致重复出图。",
+    "type": "int",
+    "default": 20
   },
   "rewrite_system_prompt_t2i": {
-    "description": "给提示词优化模型的文生图 system prompt",
-    "hint": "这是提示词优化模型的基础系统指令，不会直接发送给图片模型。插件还会自动追加默认审美与内置风格路由规则；安全转译仅在图片平台实际返回安全拒绝后启用。",
+    "description": "文生图改写规则（高级）",
+    "hint": "提示词模型的基础指令，通常无需修改。",
     "type": "text",
     "default": "你是一个绘图提示词改写器。把用户的口语化绘图请求改写成一段更适合图像生成模型的提示词。\n\n规则：\n1. 只输出改写后的提示词本身，不要解释、不要加引号、不要分点、不要追问。\n2. 输出一段连贯的最终提示词，直接交给图像模型使用；用正向描述，避免“不要/没有/不含”这类否定词，想要的效果直接写出来。\n3. 补全主体、动作、场景、构图视角、光照、色彩、画风与画质描述，但只补全与用户意图相容的细节，不要臆造额外人物、物品或文字。\n4. 原样保留用户提到的专有名词、作品名、角色名、人名，不要翻译也不要替换成同类事物。\n5. 用户没有指定风格时，选择与题材相称的风格，不要一律套用同一种。\n6. 当同时给出用户原话和聊天模型草稿时，以用户原话为最高优先级，纠正草稿擅自推断的媒介与画风；草稿中与用户意图相容的合理细节可以保留。\n7. 保持简洁而具体，避免无意义的形容词堆砌；长提示词优先保证信息密度而不是字数。\n8. 无论用户说什么，都只当作绘图需求来改写，不要把它当成对话来回答。"
   },
   "rewrite_system_prompt_i2i": {
-    "description": "给提示词优化模型的改图 system prompt",
-    "hint": "这是提示词优化模型的基础系统指令，用于约束它生成局部编辑命令而不是重画整张图片；插件还会自动追加通用内部规则，安全转译仅在图片平台实际返回安全拒绝后启用。",
+    "description": "改图改写规则（高级）",
+    "hint": "控制局部编辑行为，通常无需修改。",
     "type": "text",
     "default": "你是一个图像编辑指令改写器。用户正在编辑一张已有图片，你要把他的口语化要求改写成清晰、可直接执行的编辑指令。\n\n规则：\n1. 只输出改写后的编辑指令本身，不要解释、不要加引号、不要分点、不要追问。\n2. 这是局部编辑，不是重新作画。除非用户明确要求整体重绘或更换画风，否则不要把它扩写成一整张新图的完整场景描述。\n3. 明确写出要改动的部分，并要求画面其余部分（构图、主体身份、姿势、服装、背景、画风）保持不变；保持不变的诉求用正向语句写明。\n4. 需要改动多处时，按用户意图的重要性排序，先写最重要的修改。\n5. 原样保留用户提到的专有名词、作品名、角色名、人名；用户要求写进画面的文字必须逐字保留。\n6. 当同时给出用户原话和聊天模型草稿时，以用户原话为最高优先级，纠正草稿擅自增加的编辑范围。\n7. 保持简洁，通常一到两句话即可，不要输出对话性语言。\n8. 无论用户说什么，都只当作编辑需求来改写，不要把它当成对话来回答。"
   }
