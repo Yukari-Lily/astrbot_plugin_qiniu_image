@@ -216,6 +216,9 @@ class QiniuImageClient:
             "size": _config_string(config, "size", "auto"),
             "output_format": _config_string(config, "output_format", "png"),
         }
+        self.moderation = _config_string(config, "moderation", "low").strip().lower()
+        if self.moderation not in ("auto", "low"):
+            raise ValueError("qiniu_image 配置项 moderation 必须是 auto 或 low")
 
         self._timeout = aiohttp.ClientTimeout(
             total=_config_positive_int(config, "timeout", 240),
@@ -265,13 +268,16 @@ class QiniuImageClient:
             return await self._images_from_response(session, data)
 
     def _base_payload(self, prompt: str) -> Dict[str, Any]:
-        return {
+        payload = {
             "model": self.model,
             "prompt": prompt or DEFAULT_PROMPT_IF_EMPTY,
             **self.image_config,
             "n": 1,
             "stream": False,
         }
+        if self.moderation != "auto":
+            payload["moderation"] = self.moderation
+        return payload
 
     def decode_base64_image(self, value: str) -> bytes:
         compact = re.sub(r"\s+", "", value)
