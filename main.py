@@ -55,15 +55,16 @@ class QiniuImagePlugin(Star):
         self.rewrite_vision = bool(config.get("rewrite_vision", True))
         self.rewrite_history_rounds = max(0, int(config.get("rewrite_history_rounds", 0) or 0))
         self.rewrite_timeout = int(config.get("rewrite_timeout", 20) or 20)
-        self.rewrite_provider_id = str(config.get("rewrite_provider_id", "") or "").strip()
-        raw_fallback_providers = config.get("rewrite_fallback_provider_ids") or []
-        if not isinstance(raw_fallback_providers, (list, tuple)):
-            raw_fallback_providers = []
-        self.rewrite_fallback_provider_ids = tuple(
+        raw_rewrite_providers = config.get("rewrite_provider_ids") or []
+        if not isinstance(raw_rewrite_providers, (list, tuple)):
+            raw_rewrite_providers = []
+        rewrite_provider_ids = tuple(dict.fromkeys(
             provider_id.strip()
-            for provider_id in raw_fallback_providers
+            for provider_id in raw_rewrite_providers
             if isinstance(provider_id, str) and provider_id.strip()
-        )
+        ))
+        self.rewrite_provider_id = rewrite_provider_ids[0] if rewrite_provider_ids else ""
+        self.rewrite_fallback_provider_ids = rewrite_provider_ids[1:]
         self.rewrite_attempts_per_provider = max(
             1,
             int(config.get("rewrite_attempts_per_provider", 2) or 2),

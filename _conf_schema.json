@@ -123,20 +123,15 @@
     "type": "int",
     "default": 20
   },
-  "rewrite_provider_id": {
-    "description": "提示词改写模型 Provider ID（可选）",
-    "hint": "留空时沿用当前会话的聊天模型。填写 AstrBot 中的 Provider ID 后，普通改写与审核后的安全转译都固定使用该模型，便于选择更擅长提示词和视觉理解的模型；不建议用它绕过内容安全策略。",
-    "type": "string",
-    "default": ""
-  },
-  "rewrite_fallback_provider_ids": {
-    "description": "提示词改写备用 Provider ID",
-    "hint": "主改写模型多次失败后，按列表顺序尝试这些 AstrBot Provider。请填写 Provider ID，而不是模型显示名称；重复项会自动忽略。",
+  "rewrite_provider_ids": {
+    "description": "提示词改写模型",
+    "hint": "直接选择并排序 AstrBot 中已配置的对话模型。第一项是主改写模型，后续项按顺序作为回退模型；留空时沿用当前会话模型。普通改写与安全转译共用此模型池。",
     "type": "list",
     "default": [],
     "items": {
       "type": "string"
-    }
+    },
+    "_special": "select_providers"
   },
   "rewrite_attempts_per_provider": {
     "description": "每个改写 Provider 的尝试次数",
