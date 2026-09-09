@@ -10,6 +10,7 @@ from .style_presets import (
     QUALITY_GUIDANCE,
     SAFE_REFRAME_GUIDANCE,
     build_style_guidance,
+    clean_style_metadata,
     find_explicit_presets,
 )
 
@@ -235,6 +236,7 @@ async def rewrite(
     history_rounds: int = 0,
     style_mode: str = "disabled",
     style_strength: str = "normal",
+    quality_guidance: str = QUALITY_GUIDANCE,
     provider_id: str = "",
     fallback_provider_ids: Sequence[str] = (),
     attempts_per_provider: int = 2,
@@ -263,10 +265,10 @@ async def rewrite(
         has_image=has_image,
     )
     instruction_parts = [system_prompt]
+    if quality_guidance:
+        instruction_parts.append(quality_guidance)
     if style_guidance:
         instruction_parts.append(style_guidance)
-    else:
-        instruction_parts.append(QUALITY_GUIDANCE)
     effective_system_prompt = "\n\n".join(part for part in instruction_parts if part)
 
     if source_user_request and source_user_request.strip() != user_prompt.strip():
@@ -287,7 +289,11 @@ async def rewrite(
         image_url=image_url,
         timeout=timeout,
         attempts_per_provider=attempts_per_provider,
-        plausible=lambda text: _plausible(text, user_prompt, has_image),
+        plausible=lambda candidate: _plausible(
+            clean_style_metadata(candidate)[0],
+            user_prompt,
+            has_image,
+        ),
         purpose="提示词改写",
     )
     if not result:
@@ -295,9 +301,12 @@ async def rewrite(
             "qiniu-image: 所有提示词改写 Provider 均失败，不向图片模型发送未经优化的提示词"
         )
         return None
-    text, used_provider_id, used_vision = result
+    raw_text, used_provider_id, used_vision = result
 
-    selected = find_explicit_presets(text)
+    mentioned_presets = find_explicit_presets(raw_text)
+    text, marked_presets = clean_style_metadata(raw_text)
+    explicit_presets = find_explicit_presets(routing_request)
+    selected = marked_presets or explicit_presets or mentioned_presets
     style_name = "、".join(preset.name for preset in selected) or "未识别"
     source_log = (
         f"｜用户原话={source_user_request[:60]!r}"
@@ -326,6 +335,7 @@ async def rewrite_for_safety(
     attempts_per_provider: int = 2,
     safety_attempt: int = 1,
     safety_attempts_total: int = 5,
+    quality_guidance: str = QUALITY_GUIDANCE,
 ) -> Optional[str]:
     """审核拒绝后生成合规替代提示词；所有 Provider 均失败时返回 None。"""
     provider_ids = await _resolve_provider_ids(
@@ -348,6 +358,7 @@ async def rewrite_for_safety(
         "你是图像提示词安全转译器。将被图像平台拒绝的提示词改写为可安全生成的替代版本。\n"
         + SAFE_REFRAME_GUIDANCE
         + f"\n这是第 {current}/{total} 次安全调整，采用递进安全策略：{stage_rule}"
+        + (f"\n{quality_guidance}" if quality_guidance else "")
         + "\n保持原提示词中仍然安全的画风、角色身份、色彩与构图；只输出一段最终提示词。"
     )
     task = (
@@ -364,15 +375,22 @@ async def rewrite_for_safety(
         image_url=None,
         timeout=timeout,
         attempts_per_provider=attempts_per_provider,
-        plausible=lambda text: (
-            _plausible(text, prompt, has_image, allow_shorter=True)
-            and text.casefold() != prompt.strip().casefold()
+        plausible=lambda candidate: (
+            _plausible(
+                clean_style_metadata(candidate)[0],
+                prompt,
+                has_image,
+                allow_shorter=True,
+            )
+            and clean_style_metadata(candidate)[0].casefold()
+            != prompt.strip().casefold()
         ),
         purpose="安全转译",
     )
     if not result:
         return None
-    text, used_provider_id, _ = result
+    raw_text, used_provider_id, _ = result
+    text, _ = clean_style_metadata(raw_text)
 
     logger.info(
         f"qiniu-image: 审核拒绝后已生成安全替代提示词｜provider={used_provider_id} "

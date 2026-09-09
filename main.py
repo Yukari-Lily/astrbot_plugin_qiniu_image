@@ -25,7 +25,7 @@ from .qiniu_api import (
     QiniuSafetyError,
     QiniuTransientApiError,
 )
-from .style_presets import STYLE_MODES, STYLE_STRENGTHS, style_catalog_text
+from .style_presets import QUALITY_GUIDANCE, STYLE_MODES, STYLE_STRENGTHS, style_catalog_text
 
 REWRITE_SCOPES = ("always", "image_only", "never")
 TOOL_MODES = ("background", "sync")
@@ -86,6 +86,12 @@ class QiniuImagePlugin(Star):
                 f"qiniu_image 配置项 style_strength 必须是 {'/'.join(STYLE_STRENGTHS)} 之一"
             )
         self.style_strength = style_strength
+        global_quality_prompt = config.get("global_quality_prompt")
+        self.global_quality_prompt = (
+            QUALITY_GUIDANCE
+            if global_quality_prompt is None
+            else str(global_quality_prompt)
+        )
 
         self.dedup_ttl = int(config.get("dedup_ttl", 20) or 20)
         self._recent_msg: Dict[str, float] = {}
@@ -276,6 +282,7 @@ class QiniuImagePlugin(Star):
                 history_rounds=self.rewrite_history_rounds,
                 style_mode=self.style_mode,
                 style_strength=self.style_strength,
+                quality_guidance=self.global_quality_prompt,
                 provider_id=self.rewrite_provider_id,
                 fallback_provider_ids=self.rewrite_fallback_provider_ids,
                 attempts_per_provider=self.rewrite_attempts_per_provider,
@@ -311,6 +318,7 @@ class QiniuImagePlugin(Star):
                     attempts_per_provider=self.rewrite_attempts_per_provider,
                     safety_attempt=safety_attempt + 1,
                     safety_attempts_total=self.safety_rewrite_attempts,
+                    quality_guidance=self.global_quality_prompt,
                 )
                 if not safe_prompt:
                     return None, "生成失败喵（安全提示词改写模型均不可用）"

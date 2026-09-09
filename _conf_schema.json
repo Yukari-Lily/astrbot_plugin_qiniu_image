@@ -25,52 +25,48 @@
   },
   "style_mode": {
     "description": "内置风格",
-    "hint": "自动匹配、仅在点名时使用，或完全关闭。",
+    "hint": "auto=自动匹配；explicit_only=仅明确点名；disabled=关闭。",
     "type": "string",
     "default": "auto",
-    "options": ["auto", "explicit_only", "disabled"],
-    "labels": ["自动匹配", "仅明确点名", "关闭"]
+    "options": ["auto", "explicit_only", "disabled"]
   },
   "style_strength": {
     "description": "风格强度",
-    "hint": "控制内置风格对最终画面的影响程度。",
+    "hint": "normal=标准；subtle=轻微；strong=强烈。",
     "type": "string",
     "default": "normal",
-    "options": ["normal", "subtle", "strong"],
-    "labels": ["标准", "轻微", "强烈"]
+    "options": ["normal", "subtle", "strong"]
   },
   "quality": {
-    "description": "画质",
+    "description": "画质 quality",
     "hint": "需为当前图像模型支持的值。",
     "type": "string",
     "default": "auto"
   },
   "size": {
-    "description": "图片尺寸",
+    "description": "尺寸 size",
     "hint": "例如 auto 或 1024x1024。",
     "type": "string",
     "default": "auto"
   },
   "output_format": {
-    "description": "输出格式",
+    "description": "输出格式 output_format",
     "type": "string",
     "default": "png"
   },
   "moderation": {
-    "description": "内容审核",
-    "hint": "low 较宽松；auto 使用上游默认。公开场景建议 auto。",
+    "description": "审核严格度 moderation",
+    "hint": "low=较宽松；auto=上游默认。公开场景建议 auto。",
     "type": "string",
     "default": "low",
-    "options": ["low", "auto"],
-    "labels": ["较宽松", "上游默认"]
+    "options": ["low", "auto"]
   },
   "rewrite_scope": {
     "description": "提示词改写",
-    "hint": "选择哪些请求需要经过提示词模型优化。",
+    "hint": "always=始终启用；image_only=仅改图；never=关闭。",
     "type": "string",
     "default": "always",
-    "options": ["always", "image_only", "never"],
-    "labels": ["始终启用", "仅改图", "关闭"]
+    "options": ["always", "image_only", "never"]
   },
   "rewrite_vision": {
     "description": "改写模型查看原图",
@@ -103,11 +99,10 @@
   },
   "tool_mode": {
     "description": "出图方式",
-    "hint": "推荐后台出图；同步模式需提高 AstrBot 工具超时。",
+    "hint": "background=后台出图（推荐）；sync=同步等待，需提高工具超时。",
     "type": "string",
     "default": "background",
-    "options": ["background", "sync"],
-    "labels": ["后台出图（推荐）", "同步等待"]
+    "options": ["background", "sync"]
   },
   "background_notice": {
     "description": "后台等待提示",
@@ -163,6 +158,12 @@
     "hint": "防止协议重投导致重复出图。",
     "type": "int",
     "default": 20
+  },
+  "global_quality_prompt": {
+    "description": "全局审美规则（高级）",
+    "hint": "每次普通改写都会注入，用于统一高级感、防脏和日系文字规则；清空即可关闭。",
+    "type": "text",
+    "default": "全局审美与质量底线（无论是否选用内置风格都必须遵守）：\n1. 画面保持高级、清爽、精心设计：单一视觉中心、明确层级、受控的细节密度、清楚的主体轮廓和有意安排的留白。\n2. 绘制动漫角色或已有二次元 IP 人物时，默认采用干净的日系二次元插画语言：准确利落的线稿或边缘、稳定的赛璐璐/平涂关系、通透肤色、统一配色。只有用户原话明确要求写实摄影、油画或厚涂时才更换媒介。\n3. 故障、喷溅、半调、颗粒、磨损、拼贴等效果必须克制、局部、边界清楚，服务于构图；即使所选风格包含这些元素，也不能演变成覆盖全画面的污渍、糊块和随机噪声。\n4. 严格抑制脏乱廉价感：浑浊棕黑覆盖、油腻厚重笔触、灰脏肤色、无目的颗粒磨损、过量锐化、杂乱背景、无层次高频细节、互相打架的光源、堆叠过量的故障与特效。\n5. 日系动漫、漫画或游戏角色使用官方日文作品名和角色名；画内需要标题或装饰文字时只使用准确的官方日文原文，或用户明确指定的文字，不使用中文译名或中文装饰字。不要擅自添加无意义文字。\n6. 若题材不是二次元人物（例如商品、美食、建筑或用户明确要求摄影），选择适合题材的专业视觉语言，但仍保持干净、克制和清晰层级。\n7. “masterpiece、best quality、highly detailed、anime style、cinematic、8k、插画、高清”等只是泛化质量词，不属于用户指定的完整画风，不能用它们作为跳过内置风格的理由。"
   },
   "rewrite_system_prompt_t2i": {
     "description": "文生图改写规则（高级）",
