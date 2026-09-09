@@ -168,8 +168,17 @@ class QiniuImagePlugin(Star):
     async def draw_image(self, event: AstrMessageEvent, prompt: str):
         """生成或修改图片。输入图会自动用于改图，完成后自动发送，请勿重复调用。
 
+        调用本工具前，对模型已知的常见作品、角色和昵称直接作答并调用，不要先进行
+        Web 搜索。只有确实无法唯一识别主体时才搜索；搜索与绘图必须串行，先等待并
+        阅读搜索结果，再调用本工具，禁止与搜索工具并行调用。
+
+        prompt 应忠实保留用户原话。仅在用户使用“刚才那个”“换种风格”等指代，或
+        名称需要纠正时，补充会话中已经确定的主体身份、官方作品名和角色名。不要自行
+        添加用户未要求的画风、服装、动作、背景、构图、光照或画质词，这些由插件统一
+        改写和选择。
+
         Args:
-            prompt(string): 具体的绘图或编辑描述。
+            prompt(string): 用户的绘图或编辑要求；只补充解析指代所必需的上下文事实。
         """
         if not self.client.configured:
             yield event.plain_result("生成失败喵（未配置 api_key）")

@@ -274,8 +274,10 @@ async def rewrite(
     if source_user_request and source_user_request.strip() != user_prompt.strip():
         task = (
             f"用户原始请求：{source_user_request.strip()}\n"
-            f"聊天模型提供的{'编辑' if has_image else '绘图'}草稿：{user_prompt}\n"
-            "以用户原始请求为最高优先级。草稿仅用于补足主体知识和合理细节；草稿擅自推断的画风、媒介或构图不属于用户硬性要求，可以纠正。"
+            f"聊天模型提供的上下文草稿：{user_prompt}\n"
+            "用户原始请求是唯一的创作需求来源。上下文草稿只能用于解析省略或指代（如“刚才那个”“再画一张”“换种风格”）、补回用户先前明确要求延续的内容，以及确认主体身份、官方作品名、角色名等客观事实。"
+            "草稿中没有直接来自用户请求的服装、动作、表情、物品、场景、背景、构图、视角、光照、配色、媒介、画风、特效和画质词一律忽略，不得写入最终提示词。"
+            "即使用户把创作选择交给模型，也应依据本系统提示中的风格库与路由规则独立完成，不得把草稿自行添加的视觉方案视为用户要求。"
         )
     else:
         task = f"{'编辑要求' if has_image else '绘图要求'}：{user_prompt}"
@@ -291,7 +293,7 @@ async def rewrite(
         attempts_per_provider=attempts_per_provider,
         plausible=lambda candidate: _plausible(
             clean_style_metadata(candidate)[0],
-            user_prompt,
+            routing_request,
             has_image,
         ),
         purpose="提示词改写",
