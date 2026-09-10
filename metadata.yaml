@@ -2,5 +2,5 @@ name: astrbot_plugin_qiniu_image
 display_name: Modelink AI 绘图
 desc: Modelink AI 绘图
 author: Yukari Lily
-version: "1.1.0"
+version: "1.2.0"
 repo: https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image

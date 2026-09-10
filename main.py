@@ -25,7 +25,12 @@ from .qiniu_api import (
     QiniuSafetyError,
     QiniuTransientApiError,
 )
-from .style_presets import QUALITY_GUIDANCE, STYLE_MODES, STYLE_STRENGTHS, style_catalog_text
+from .style_presets import (
+    QUALITY_GUIDANCE,
+    STYLE_MODES,
+    STYLE_STRENGTHS,
+    style_catalog_text,
+)
 
 REWRITE_SCOPES = ("always", "image_only", "never")
 TOOL_MODES = ("background", "sync")
@@ -35,7 +40,7 @@ TOOL_MODES = ("background", "sync")
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "1.1.0",
+    "1.2.0",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -53,7 +58,6 @@ class QiniuImagePlugin(Star):
             raise ValueError(f"qiniu_image 配置项 rewrite_scope 必须是 {'/'.join(REWRITE_SCOPES)} 之一")
         self.rewrite_scope = scope
         self.rewrite_vision = bool(config.get("rewrite_vision", True))
-        self.rewrite_history_rounds = max(0, int(config.get("rewrite_history_rounds", 0) or 0))
         self.rewrite_timeout = int(config.get("rewrite_timeout", 20) or 20)
         raw_rewrite_providers = config.get("rewrite_provider_ids") or []
         if not isinstance(raw_rewrite_providers, (list, tuple)):
@@ -102,6 +106,7 @@ class QiniuImagePlugin(Star):
         self.tool_mode = mode
         self.background_notice = (config.get("background_notice") or "").strip()
         self._tasks: Set[asyncio.Task] = set()
+        self._last_image_prompts: Dict[str, Dict[str, object]] = {}
 
         if not self.client.configured:
             logger.warning("qiniu-image: 未配置 api_key，插件已加载但无法出图")
@@ -157,7 +162,6 @@ class QiniuImagePlugin(Star):
         image_b64, error_text = await self._draw(
             event,
             user_prompt,
-            source_user_request=user_prompt,
         )
         if image_b64:
             yield event.chain_result([Comp.Image.fromBase64(image_b64)])
@@ -168,29 +172,30 @@ class QiniuImagePlugin(Star):
     async def draw_image(self, event: AstrMessageEvent, prompt: str):
         """生成或修改图片。输入图会自动用于改图，完成后自动发送，请勿重复调用。
 
-        调用本工具前，对模型已知的常见作品、角色和昵称直接作答并调用，不要先进行
-        Web 搜索。只有确实无法唯一识别主体时才搜索；搜索与绘图必须串行，先等待并
-        阅读搜索结果，再调用本工具，禁止与搜索工具并行调用。
+        调用前先结合你的系统人设、完整群聊上下文和用户当前意图形成一份完整绘图方案。
+        例如用户让“你”画自拍时，要把你的人格、外观设定和自拍语境具体写入 prompt，
+        不能只传“自拍”。用户把创作选择交给你时，可合理决定服装、动作、场景、构图、
+        光照、配色和画风。除非你明确留给插件自动选择内置风格，否则不要把创作决定留给
+        提示词优化模型；它只负责整理表达、校正事实和执行插件明确配置的规则。
 
-        prompt 应忠实保留用户原话。仅在用户使用“刚才那个”“换种风格”等指代，或
-        名称需要纠正时，补充会话中已经确定的主体身份、官方作品名和角色名。不要自行
-        添加用户未要求的画风、服装、动作、背景、构图、光照或画质词，这些由插件统一
-        改写和选择。
+        对你已知的常见作品、角色和昵称直接补全准确的官方作品名、角色名和关键外观。
+        只有现有知识不足以可靠还原或无法唯一识别主体时才搜索；搜索与绘图必须串行，
+        先阅读搜索结果，再调用本工具，禁止与搜索工具并行调用。
+
+        若用户要求修改、延续或重画插件上一张作品，而当前上下文没有完整执行提示词，
+        先调用 get_last_image_prompt 取得图片模型实际收到的版本，再基于它编写本次完整方案。
+        用户本轮明确要求始终优先，不要把旧提示词中已被用户推翻的内容带回来。
 
         Args:
-            prompt(string): 用户的绘图或编辑要求；只补充解析指代所必需的上下文事实。
+            prompt(string): 结合用户要求、Bot 人设、完整会话和必要考据写成的完整绘图或编辑方案。
         """
         if not self.client.configured:
             yield event.plain_result("生成失败喵（未配置 api_key）")
             return
 
         prompt = (prompt or "").strip()
-        source_user_request = (event.message_str or "").strip()
-
         if self.tool_mode == "background":
-            task = asyncio.create_task(
-                self._draw_and_push(event, prompt, source_user_request=source_user_request)
-            )
+            task = asyncio.create_task(self._draw_and_push(event, prompt))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
             if self.background_notice:
@@ -200,7 +205,6 @@ class QiniuImagePlugin(Star):
         image_b64, error_text = await self._draw(
             event,
             prompt,
-            source_user_request=source_user_request,
         )
         if image_b64:
             yield event.chain_result([Comp.Image.fromBase64(image_b64)])
@@ -220,19 +224,30 @@ class QiniuImagePlugin(Star):
             f"{mode_description}\n\n{style_catalog_text(concise=True)}"
         )
 
+    @filter.llm_tool(name="get_last_image_prompt")
+    async def get_last_image_prompt(self, event: AstrMessageEvent):
+        """取得当前会话中插件最近一次实际送给图片模型的提示词。用户要求修改、延续、重画或追问上一张生成图，而上下文没有完整执行稿时调用；不要用于无关的新绘图。"""
+        record = self._last_image_prompts.get(str(event.unified_msg_origin))
+        if not record:
+            return "当前会话还没有可读取的实际出图提示词。请根据现有对话理解用户需求。"
+        mode = "改图" if record.get("has_image") else "文生图"
+        return (
+            "以下是插件最近一次真正提交给图片模型的执行记录。修改时以用户本轮要求覆盖旧内容，"
+            "其余需要延续的主体身份、外观、场景和画风可从实际提示词继承。\n"
+            f"模式：{mode}\n"
+            f"实际提示词：{record['prompt']}"
+        )
+
     async def _draw_and_push(
         self,
         event: AstrMessageEvent,
         prompt: str,
-        *,
-        source_user_request: str,
     ) -> None:
         """后台出图并推送。"""
         try:
             image_b64, error_text = await self._draw(
                 event,
                 prompt,
-                source_user_request=source_user_request,
             )
         except asyncio.CancelledError:
             raise
@@ -273,9 +288,11 @@ class QiniuImagePlugin(Star):
         self,
         event: AstrMessageEvent,
         user_prompt: str,
-        *,
-        source_user_request: str = "",
     ) -> Tuple[Optional[str], Optional[str]]:
+        user_prompt = (user_prompt or "").strip()
+        if not user_prompt:
+            return None, "生成失败喵（请输入具体的绘图或编辑描述）"
+
         image_ref = await resolve_input_image(self.context, event, self.client)
 
         prompt = user_prompt
@@ -288,52 +305,105 @@ class QiniuImagePlugin(Star):
                 timeout=self.rewrite_timeout,
                 system_prompt=self.rewrite_prompt_i2i if image_ref else self.rewrite_prompt_t2i,
                 image_url=self._vision_url(image_ref),
-                history_rounds=self.rewrite_history_rounds,
                 style_mode=self.style_mode,
                 style_strength=self.style_strength,
                 quality_guidance=self.global_quality_prompt,
                 provider_id=self.rewrite_provider_id,
                 fallback_provider_ids=self.rewrite_fallback_provider_ids,
                 attempts_per_provider=self.rewrite_attempts_per_provider,
-                source_user_request=source_user_request,
             )
             if not rewritten_prompt:
                 return None, "生成失败喵（所有提示词优化模型均不可用）"
             prompt = rewritten_prompt
 
-        for safety_attempt in range(self.safety_rewrite_attempts + 1):
-            try:
-                return await self._generate(
+        try:
+            result = await self._generate(
+                event,
+                prompt,
+                image_ref,
+                propagate_safety=self.safety_rewrite_attempts > 0,
+            )
+        except QiniuSafetyError as exc:
+            logger.warning(
+                f"qiniu-image rejected by safety, starting fallback | {self._ctx(event)} "
+                f"model={self.client.model} status={exc.status} code={exc.code}"
+            )
+        else:
+            if result[0]:
+                self._remember_image_prompt(
                     event,
                     prompt,
+                    has_image=bool(image_ref),
+                )
+            return result
+
+        for safety_attempt in range(1, self.safety_rewrite_attempts + 1):
+            safe_prompt = await rewrite_for_safety(
+                self.context,
+                event.unified_msg_origin,
+                prompt,
+                has_image=bool(image_ref),
+                timeout=self.rewrite_timeout,
+                provider_id=self.rewrite_provider_id,
+                fallback_provider_ids=self.rewrite_fallback_provider_ids,
+                attempts_per_provider=self.rewrite_attempts_per_provider,
+                safety_attempt=safety_attempt,
+                safety_attempts_total=self.safety_rewrite_attempts,
+                quality_guidance=self.global_quality_prompt,
+            )
+            if not safe_prompt:
+                logger.warning(
+                    f"qiniu-image: safety rewrite produced no usable prompt, advancing stage | "
+                    f"{self._ctx(event)} attempt={safety_attempt}/{self.safety_rewrite_attempts}"
+                )
+                continue
+
+            try:
+                result = await self._generate(
+                    event,
+                    safe_prompt,
                     image_ref,
-                    propagate_safety=safety_attempt < self.safety_rewrite_attempts,
+                    propagate_safety=True,
                 )
             except QiniuSafetyError as exc:
                 logger.warning(
-                    f"qiniu-image rejected by safety, preparing safe alternative | {self._ctx(event)} "
+                    f"qiniu-image safety fallback rejected, advancing stage | {self._ctx(event)} "
                     f"model={self.client.model} status={exc.status} code={exc.code} "
-                    f"attempt={safety_attempt + 1}/{self.safety_rewrite_attempts}"
+                    f"attempt={safety_attempt}/{self.safety_rewrite_attempts}"
                 )
-                safe_prompt = await rewrite_for_safety(
-                    self.context,
-                    event.unified_msg_origin,
-                    prompt,
-                    source_user_request=source_user_request,
-                    has_image=bool(image_ref),
-                    timeout=self.rewrite_timeout,
-                    provider_id=self.rewrite_provider_id,
-                    fallback_provider_ids=self.rewrite_fallback_provider_ids,
-                    attempts_per_provider=self.rewrite_attempts_per_provider,
-                    safety_attempt=safety_attempt + 1,
-                    safety_attempts_total=self.safety_rewrite_attempts,
-                    quality_guidance=self.global_quality_prompt,
-                )
-                if not safe_prompt:
-                    return None, "生成失败喵（安全提示词改写模型均不可用）"
                 prompt = safe_prompt
+                continue
 
-        return None, "生成失败喵（内容未通过安全审核）"
+            if result[0]:
+                self._remember_image_prompt(
+                    event,
+                    safe_prompt,
+                    has_image=bool(image_ref),
+                )
+            return result
+
+        return None, "生成失败喵（所有安全级别均未能生成可用图片）"
+
+    def _remember_image_prompt(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        *,
+        has_image: bool,
+    ) -> None:
+        """记录当前会话最后一次实际提交的提示词，供后续修改透明继承。"""
+        key = str(event.unified_msg_origin)
+        self._last_image_prompts[key] = {
+            "prompt": prompt,
+            "has_image": has_image,
+            "updated_at": time.monotonic(),
+        }
+        if len(self._last_image_prompts) > 100:
+            oldest = min(
+                self._last_image_prompts,
+                key=lambda item: float(self._last_image_prompts[item]["updated_at"]),
+            )
+            self._last_image_prompts.pop(oldest, None)
 
     async def _generate(
         self,

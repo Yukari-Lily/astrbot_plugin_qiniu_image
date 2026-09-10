@@ -1,7 +1,6 @@
 """改写绘图提示词。"""
 
 import asyncio
-import json
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from astrbot.api import logger
@@ -16,8 +15,6 @@ from .style_presets import (
 
 _MIN_LENGTH = 4
 _MAX_LENGTH = 1500
-
-_HISTORY_ITEM_LIMIT = 500
 
 _REFUSAL_MARKERS = (
     "抱歉",
@@ -44,6 +41,10 @@ _SAFETY_REFRAME_STAGES = (
     "第五级（最大安全）：转为适合全年龄展示的普通角色插画或时尚编辑肖像，穿完整日常服装，采用自然表情、中性动作和非私密场景，仅保留主体身份、核心配色、画风及安全的叙事元素。",
 )
 
+_OPTIMIZER_BOUNDARY_GUIDANCE = """
+职责边界：主聊天模型拥有完整会话、Bot 人设和工具能力，负责全部创作决策并形成完整绘图或编辑方案；当前模型只接收这一份方案，并将它转换为图片模型容易执行的表达。将方案视为完整、权威的内容来源。除插件另外提供的全局质量规则和内置风格路由外，不得自行新增、替换或重新选择主体、人物数量、身份设定、剧情、服装、动作、表情、物品、场景、背景、构图、视角、光照、配色、媒介、画风、文字或特效。只可调整语序、消除歧义、校正客观事实、删除重复或内部冲突描述，并补充不改变既定画面语义的通用执行措辞。
+""".strip()
+
 def _plausible(
     text: str,
     user_prompt: str,
@@ -64,63 +65,11 @@ def _plausible(
     return True
 
 
-def _flatten_content(content: Any) -> str:
-    """历史消息的 content 可能是字符串，也可能是 ContentPart 列表。"""
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict) and part.get("type") == "text":
-                text = part.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return " ".join(p.strip() for p in parts if p.strip()).strip()
-    return ""
-
-
-async def load_history(context: Any, umo: str, rounds: int) -> List[Dict[str, str]]:
-    """取当前会话最近 rounds 轮问答，失败一律返回空列表。"""
-    if rounds <= 0:
-        return []
-    try:
-        manager = context.conversation_manager
-        cid = await manager.get_curr_conversation_id(umo)
-        if not cid:
-            return []
-        conversation = await manager.get_conversation(umo, cid)
-        raw = json.loads(getattr(conversation, "history", None) or "[]")
-    except Exception as exc:
-        logger.debug(f"qiniu-image: 读取历史对话失败，跳过注入（{type(exc).__name__}）")
-        return []
-    if not isinstance(raw, list):
-        return []
-
-    messages: List[Dict[str, str]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        if item.get("tool_calls") or item.get("tool_call_id"):
-            continue
-        role = item.get("role")
-        if role not in ("user", "assistant"):
-            continue
-        text = _flatten_content(item.get("content"))
-        if not text:
-            continue
-        messages.append({"role": role, "content": text[:_HISTORY_ITEM_LIMIT]})
-
-    return messages[-(rounds * 2):]
-
-
 async def _call_llm(
     context: Any,
     provider_id: str,
     prompt: str,
     system_prompt: str,
-    contexts: Optional[List[Dict[str, str]]],
     image_urls: Optional[List[str]],
 ) -> Optional[str]:
     kwargs: Dict[str, Any] = {
@@ -128,8 +77,6 @@ async def _call_llm(
         "prompt": prompt,
         "system_prompt": system_prompt,
     }
-    if contexts:
-        kwargs["contexts"] = contexts
     if image_urls:
         kwargs["image_urls"] = image_urls
 
@@ -173,7 +120,6 @@ async def _try_providers(
     *,
     prompt: str,
     system_prompt: str,
-    contexts: Optional[List[Dict[str, str]]],
     image_url: Optional[str],
     timeout: int,
     attempts_per_provider: int,
@@ -195,7 +141,6 @@ async def _try_providers(
                             provider_id,
                             prompt,
                             system_prompt,
-                            contexts,
                             image_urls,
                         ),
                         timeout=max(1, timeout),
@@ -233,14 +178,12 @@ async def rewrite(
     timeout: int,
     system_prompt: str,
     image_url: Optional[str] = None,
-    history_rounds: int = 0,
     style_mode: str = "disabled",
     style_strength: str = "normal",
     quality_guidance: str = QUALITY_GUIDANCE,
     provider_id: str = "",
     fallback_provider_ids: Sequence[str] = (),
     attempts_per_provider: int = 2,
-    source_user_request: str = "",
 ) -> Optional[str]:
     """返回改写后的提示词；所有 Provider 均失败时返回 None。"""
     if not user_prompt or not system_prompt:
@@ -256,44 +199,32 @@ async def rewrite(
         logger.warning("qiniu-image: 没有可用的提示词改写 Provider")
         return None
 
-    contexts = await load_history(context, umo, history_rounds)
-    routing_request = source_user_request.strip() or user_prompt
     style_guidance = build_style_guidance(
-        routing_request,
+        user_prompt,
         mode=style_mode,
         strength=style_strength,
         has_image=has_image,
     )
-    instruction_parts = [system_prompt]
+    instruction_parts = [system_prompt, _OPTIMIZER_BOUNDARY_GUIDANCE]
     if quality_guidance:
         instruction_parts.append(quality_guidance)
     if style_guidance:
         instruction_parts.append(style_guidance)
     effective_system_prompt = "\n\n".join(part for part in instruction_parts if part)
 
-    if source_user_request and source_user_request.strip() != user_prompt.strip():
-        task = (
-            f"用户原始请求：{source_user_request.strip()}\n"
-            f"聊天模型提供的上下文草稿：{user_prompt}\n"
-            "用户原始请求是唯一的创作需求来源。上下文草稿只能用于解析省略或指代（如“刚才那个”“再画一张”“换种风格”）、补回用户先前明确要求延续的内容，以及确认主体身份、官方作品名、角色名等客观事实。"
-            "草稿中没有直接来自用户请求的服装、动作、表情、物品、场景、背景、构图、视角、光照、配色、媒介、画风、特效和画质词一律忽略，不得写入最终提示词。"
-            "即使用户把创作选择交给模型，也应依据本系统提示中的风格库与路由规则独立完成，不得把草稿自行添加的视觉方案视为用户要求。"
-        )
-    else:
-        task = f"{'编辑要求' if has_image else '绘图要求'}：{user_prompt}"
+    task = f"主聊天模型完成的{'编辑' if has_image else '绘图'}方案：{user_prompt}"
 
     result = await _try_providers(
         context,
         provider_ids,
         prompt=task,
         system_prompt=effective_system_prompt,
-        contexts=contexts,
         image_url=image_url,
         timeout=timeout,
         attempts_per_provider=attempts_per_provider,
         plausible=lambda candidate: _plausible(
             clean_style_metadata(candidate)[0],
-            routing_request,
+            user_prompt,
             has_image,
         ),
         purpose="提示词改写",
@@ -307,18 +238,13 @@ async def rewrite(
 
     mentioned_presets = find_explicit_presets(raw_text)
     text, marked_presets = clean_style_metadata(raw_text)
-    explicit_presets = find_explicit_presets(routing_request)
+    explicit_presets = find_explicit_presets(user_prompt)
     selected = marked_presets or explicit_presets or mentioned_presets
     style_name = "、".join(preset.name for preset in selected) or "未识别"
-    source_log = (
-        f"｜用户原话={source_user_request[:60]!r}"
-        if source_user_request and source_user_request.strip() != user_prompt.strip()
-        else ""
-    )
     logger.info(
         f"qiniu-image: 提示词改写｜provider={used_provider_id} "
-        f"历史={len(contexts)}条 视觉={'是' if used_vision else '否'}"
-        f"｜内置风格={style_name}{source_log}"
+        f"历史=由主聊天模型处理 视觉={'是' if used_vision else '否'}"
+        f"｜内置风格={style_name}"
         f"｜原文={user_prompt[:60]!r}｜改写={text[:120]!r}"
     )
     return text
@@ -329,7 +255,6 @@ async def rewrite_for_safety(
     umo: str,
     prompt: str,
     *,
-    source_user_request: str,
     has_image: bool,
     timeout: int,
     provider_id: str = "",
@@ -364,7 +289,6 @@ async def rewrite_for_safety(
         + "\n保持原提示词中仍然安全的画风、角色身份、色彩与构图；只输出一段最终提示词。"
     )
     task = (
-        f"用户原始请求：{source_user_request or prompt}\n"
         f"被审核拒绝的提示词：{prompt}\n"
         "请给出尽量接近原意、但明确非色情、衣着完整且适合全年龄展示的版本。"
     )
@@ -373,7 +297,6 @@ async def rewrite_for_safety(
         provider_ids,
         prompt=task,
         system_prompt=system_prompt,
-        contexts=None,
         image_url=None,
         timeout=timeout,
         attempts_per_provider=attempts_per_provider,
