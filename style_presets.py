@@ -304,7 +304,7 @@ def build_style_guidance(
     strength: str,
     has_image: bool,
 ) -> str:
-    """构造给改写模型看的风格路由规则；不直接修改用户提示词。"""
+    """构造给优化模型看的风格路由规则。"""
     if mode == "disabled":
         return ""
 
@@ -319,8 +319,8 @@ def build_style_guidance(
     )
     strength_rule = {
         "subtle": "只借用少量最有辨识度的视觉特征，不让风格压过主体和内容。",
-        "normal": "完整使用核心视觉语言，但删除与用户要求无关或冲突的细节。",
-        "strong": "在不改变用户硬性要求的前提下，充分使用所选风格的构图、色彩和材质语言。",
+        "normal": "完整使用核心视觉语言，但删除与输入方案无关或冲突的细节。",
+        "strong": "在不改变输入方案硬性要求的前提下，充分使用所选风格的构图、色彩和材质语言。",
     }[strength]
 
     lines = [

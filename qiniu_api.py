@@ -15,7 +15,29 @@ import aiohttp
 
 GENERATIONS_PATH = "/bypass/openai/v1/images/generations"
 EDITS_PATH = "/bypass/openai/v1/images/edits"
-DEFAULT_PROMPT_IF_EMPTY = "高质量、细节丰富、照片风格、高清"
+API_BASE = "https://api.qnaigc.com"
+REQUEST_ATTEMPTS = 4
+REQUEST_TIMEOUT_SECONDS = 480
+CONNECT_TIMEOUT_SECONDS = 30
+MAX_INPUT_IMAGE_BYTES = 40_000_000
+MAX_OUTPUT_IMAGE_BYTES = 80 * 1024 * 1024
+OUTPUT_FORMAT = "png"
+SUPPORTED_MODELS = (
+    "openai/gpt-image-2.5-sunburst",
+    "openai/gpt-image-2.5-flare",
+    "openai/gpt-image-2",
+)
+SUPPORTED_QUALITIES = ("low", "medium", "high", "auto")
+SUPPORTED_SIZES = (
+    "auto",
+    "1024x1024",
+    "1536x1024",
+    "1024x1536",
+    "2048x2048",
+    "2048x1152",
+    "3840x2160",
+    "2160x3840",
+)
 
 
 class QiniuApiError(RuntimeError):
@@ -100,13 +122,15 @@ def _validate_http_url(value: str, field_name: str) -> str:
     return value
 
 
-def _image_mime(raw: bytes) -> Optional[str]:
+def _image_mime(raw: bytes, *, allow_gif: bool = False) -> Optional[str]:
     if raw.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if raw.startswith(b"\xff\xd8\xff"):
         return "image/jpeg"
     if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
         return "image/webp"
+    if allow_gif and raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
     return None
 
 
@@ -198,34 +222,40 @@ def _config_positive_int(config: Any, name: str, default: int) -> int:
     return value
 
 
+def _config_choice(config: Any, name: str, default: str, choices: Tuple[str, ...]) -> str:
+    value = _config_string(config, name, default)
+    if value not in choices:
+        raise ValueError(f"qiniu_image 配置项 {name} 必须是 {'/'.join(choices)} 之一")
+    return value
+
+
 class QiniuImageClient:
     def __init__(self, config: Any):
-        self.api_base = _config_string(config, "api_base", "https://api.qnaigc.com").rstrip("/")
-        base_parts = urlsplit(self.api_base)
-        if base_parts.scheme not in ("http", "https") or not base_parts.netloc:
-            raise ValueError("qiniu_image 配置项 api_base 必须是有效的 HTTP(S) 地址")
-
+        self.api_base = API_BASE
         self.api_key = _config_string(config, "api_key", "", allow_empty=True)
-        self.model = _config_string(config, "model", "openai/gpt-image-2")
+        self.model = _config_choice(
+            config,
+            "model",
+            "openai/gpt-image-2.5-sunburst",
+            SUPPORTED_MODELS,
+        )
 
-        self.retries = _config_positive_int(config, "retries", 3)
-        self.max_download_bytes = _config_positive_int(config, "max_download_bytes", 40 * 1024 * 1024)
-
+        self.retries = REQUEST_ATTEMPTS
         self.image_config = {
-            "quality": _config_string(config, "quality", "auto"),
-            "size": _config_string(config, "size", "auto"),
-            "output_format": _config_string(config, "output_format", "png"),
+            "quality": _config_choice(config, "quality", "auto", SUPPORTED_QUALITIES),
+            "size": _config_choice(config, "size", "auto", SUPPORTED_SIZES),
+            "output_format": OUTPUT_FORMAT,
         }
         self.moderation = _config_string(config, "moderation", "low").strip().lower()
         if self.moderation not in ("auto", "low"):
             raise ValueError("qiniu_image 配置项 moderation 必须是 auto 或 low")
 
         self._timeout = aiohttp.ClientTimeout(
-            total=_config_positive_int(config, "timeout", 240),
-            connect=_config_positive_int(config, "connect_timeout", 15),
-            sock_connect=_config_positive_int(config, "connect_timeout", 15),
+            total=REQUEST_TIMEOUT_SECONDS,
+            connect=CONNECT_TIMEOUT_SECONDS,
+            sock_connect=CONNECT_TIMEOUT_SECONDS,
         )
-        self._semaphore = asyncio.Semaphore(_config_positive_int(config, "concurrency", 1))
+        self._semaphore = asyncio.Semaphore(_config_positive_int(config, "concurrency", 3))
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
 
@@ -270,7 +300,7 @@ class QiniuImageClient:
     def _base_payload(self, prompt: str) -> Dict[str, Any]:
         payload = {
             "model": self.model,
-            "prompt": prompt or DEFAULT_PROMPT_IF_EMPTY,
+            "prompt": prompt,
             **self.image_config,
             "n": 1,
             "stream": False,
@@ -279,16 +309,16 @@ class QiniuImageClient:
             payload["moderation"] = self.moderation
         return payload
 
-    def decode_base64_image(self, value: str) -> bytes:
+    def decode_base64_image(self, value: str, *, max_bytes: int = MAX_INPUT_IMAGE_BYTES) -> bytes:
         compact = re.sub(r"\s+", "", value)
-        max_encoded_length = ((self.max_download_bytes + 2) // 3) * 4
+        max_encoded_length = ((max_bytes + 2) // 3) * 4
         if not compact or len(compact) > max_encoded_length:
             raise ValueError("图片 Base64 为空或超过大小限制")
         try:
             raw = base64.b64decode(compact, validate=True)
         except (binascii.Error, ValueError):
             raise ValueError("图片 Base64 格式无效") from None
-        if not raw or len(raw) > self.max_download_bytes:
+        if not raw or len(raw) > max_bytes:
             raise ValueError("图片为空或超过大小限制")
         return raw
 
@@ -307,9 +337,9 @@ class QiniuImageClient:
                 raw = self.decode_base64_image(encoded)
             except ValueError as exc:
                 raise QiniuInputError(str(exc)) from None
-            mime = _image_mime(raw)
+            mime = _image_mime(raw, allow_gif=True)
             if not mime:
-                raise QiniuInputError("输入图片格式无效，仅支持 PNG、JPEG 或 WebP")
+                raise QiniuInputError("输入图片格式无效，仅支持 PNG、JPEG、WebP 或 GIF")
             compact = re.sub(r"\s+", "", encoded)
             return f"data:{mime};base64,{compact}"
         raise QiniuInputError("未能识别输入图片（仅支持 URL 或 base64://）")
@@ -414,7 +444,7 @@ class QiniuImageClient:
                     content_length = resp.headers.get("Content-Length")
                     if content_length:
                         try:
-                            if int(content_length) > self.max_download_bytes:
+                            if int(content_length) > MAX_OUTPUT_IMAGE_BYTES:
                                 raise QiniuImageDownloadError("响应图片超过大小限制")
                         except ValueError:
                             pass
@@ -428,7 +458,7 @@ class QiniuImageClient:
                     content = bytearray()
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         content.extend(chunk)
-                        if len(content) > self.max_download_bytes:
+                        if len(content) > MAX_OUTPUT_IMAGE_BYTES:
                             raise QiniuImageDownloadError("响应图片超过大小限制")
                     if not content:
                         raise QiniuImageDownloadError("响应图片为空")
@@ -462,7 +492,7 @@ class QiniuImageClient:
                 raise QiniuResponseError("上游返回了无效的图片 data URI")
             value = value[index + len(marker):]
         try:
-            raw = self.decode_base64_image(value)
+            raw = self.decode_base64_image(value, max_bytes=MAX_OUTPUT_IMAGE_BYTES)
         except ValueError as exc:
             raise QiniuResponseError(str(exc)) from None
         if not _image_mime(raw):
