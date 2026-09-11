@@ -130,7 +130,11 @@ class QiniuImagePlugin(Star):
         rules = (
             "绘图前结合用户当前要求、完整会话和你的人设形成方案；主聊天模型负责创作，优化器只整理核对。"
             "draw_image 的 task 应区分 create 新画、edit 局部修改、redraw 整张重画；"
-            "图片角色为 character 人物参考、style 风格参考或 edit 编辑原图，不能见图就改图。"
+            "图片角色为 character 人物参考、style 图片绑定或 edit 编辑原图，不能见图就改图；style 图片不作为画风依据。"
+            "人物参考图只用于身份和稳定外观特征：发型、发色、脸部、发饰、服装结构和配色；"
+            "不得从参考图带入动作、姿势、手势、表情、镜头、视角、构图、背景、光照或画风。"
+            "用户原消息没有 input 图片时，最终 draw_image 不得向图片模型传任何图片；"
+            "主模型可继续把参考图核对出的外观写入 characters.features/evidence，动作、构图和画风必须来自文字方案。"
             "人物列表逐人填写 id/name/work/version/position/features/evidence/identity_status；"
             "confirmed 需要可靠身份外观依据，原创人物用 original，不确定用 uncertain 并停止绘图。"
             "只改某人时使用 edit 和 base_generation_id，characters 只提交该人补丁，沿用原 id；其余自动继承。"
@@ -153,7 +157,7 @@ class QiniuImagePlugin(Star):
         if self.style_mode == "auto":
             preferred = "、".join(p.name for p in STYLE_PRESETS if p.auto_preference)
             rules += (
-                "当前为自动风格：用户未指定画风且无需保留目标作品或风格参考时，在创作方案阶段就优先选一个相容的内置偏好画风，"
+                "当前为自动风格：用户未指定画风且无需保留目标作品原有画风时，在创作方案阶段就优先选一个相容的内置偏好画风，"
                 "将名称写入 prompt，将自选理由写入 creative_choices，不写入 user_requirements。"
                 "偏好风格为：" + preferred + "。相容时优先这些风格，再考虑其余内置风格。"
                 "不要先自行套用普通动画主视觉、电影感或 Pixar/3D 渲染再将它们锁定为用户要求；"

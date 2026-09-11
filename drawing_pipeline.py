@@ -276,10 +276,22 @@ class DrawingPipeline:
         task = frozen["task"]
         bindings = [{"index": i + 1, **a["binding"]} for i, a in enumerate(assets)]
         context_text = task_context(task, frozen["base"], bindings) if task is not None else ""
-        visual_inputs = [image_data(a["bytes"]) for a in assets]
+        # Only character references are exposed to the optimizer. Edit
+        # originals and style-bound images must not become visual guidance for
+        # action, composition, background, lighting, material, or style.
+        feature_assets = [a for a in assets if a["binding"]["role"] == "character"]
+        visual_inputs = [image_data(a["bytes"]) for a in feature_assets]
+        # Reference images remain available to the optimizer for extracting
+        # textual character features. They reach the image model only when
+        # the original request explicitly supplied an input:N image.
+        original_input_assets = [
+            a for a in assets if a["binding"]["source"].startswith("input:")
+        ]
+        generation_assets = assets if original_input_assets else []
+        generation_edit = edit and bool(generation_assets)
         rewrite_metadata = {}
         prompt = await rewrite(self.plugin.context, event.unified_msg_origin, user_prompt,
-                               has_image=edit, style_mode=self.plugin.style_mode,
+                               has_image=generation_edit, style_mode=self.plugin.style_mode,
                                style_strength=self.plugin.style_strength, drawing_task=task,
                                evidence_context=context_text, image_urls=visual_inputs,
                                result_metadata=rewrite_metadata, **self.providers)
@@ -299,15 +311,29 @@ class DrawingPipeline:
                                        evidence_context=context_text, result_metadata=rewrite_metadata, **self.providers)
                 notices.append("本次未使用图片参考，已依据确认的文字资料生成。")
                 logger.info(f"qiniu-image text fallback | generation={frozen['id']} images=0")
+                original_input_assets = []
+                generation_assets = []
+                generation_edit = False
         if not prompt:
             return None, "生成失败喵（提示词优化模型不可用或人物结构校验失败）"
         from .style_presets import LINE_EXECUTION_GUIDANCE
         image_instructions = "\n\n" + LINE_EXECUTION_GUIDANCE
-        if bindings:
-            roles = {"edit": "待编辑原图", "character": "人物身份外观参考", "style": "仅画风参考"}
-            labels = [f"输入图 {b['index']}：{roles[b['role']]}" + (f"，对应人物 {b['character_id']}" if b.get("character_id") else "") for b in bindings]
+        generation_bindings = [
+            {"index": i + 1, **a["binding"]} for i, a in enumerate(generation_assets)
+        ]
+        if generation_bindings:
+            roles = {"edit": "待编辑原图", "character": "人物身份外观参考（只取稳定特征）", "style": "图片输入（不读取画风）"}
+            labels = [f"输入图 {b['index']}：{roles[b['role']]}" + (f"，对应人物 {b['character_id']}" if b.get("character_id") else "") for b in generation_bindings]
             image_instructions += "\n\n图片用途（编号不画入画面）：\n" + "\n".join(labels)
-        image_refs = ["base64://" + base64.b64encode(a["bytes"]).decode("ascii") for a in assets]
+            if any(b["role"] == "character" for b in generation_bindings):
+                image_instructions += (
+                    "\n\n人物参考图仅用于身份和稳定外观特征；不要参考或继承其中的动作、姿势、手势、表情、"
+                    "镜头、视角、构图、布局、背景、场景、光照、色调、材质、文字、特效或画风。"
+                    "最终动作、构图和画风严格以文字执行稿为准。"
+                )
+            if any(b["role"] == "style" for b in generation_bindings):
+                image_instructions += "\n\n风格参考图不提供画风依据；最终画风严格以文字执行稿为准。"
+        image_refs = ["base64://" + base64.b64encode(a["bytes"]).decode("ascii") for a in generation_assets]
         logger.info(f"qiniu-image drawing | generation={frozen['id']} operation={task['operation'] if task else 'legacy'} "
                     f"base={(frozen['base'] or {}).get('id', '-')} images={len(image_refs)} "
                     f"characters={[c['id'] for c in task['characters']] if task else []} "

@@ -6,6 +6,15 @@ import re
 from typing import Any
 
 
+REFERENCE_FEATURE_GUIDANCE = (
+    "参考图使用边界（严格）：人物参考图只用于核对身份和稳定、可见的外观特征，"
+    "包括脸部、发型、发色、眼睛、肤色、发饰、服装结构、服装颜色和标志物。"
+    "不得从参考图继承或猜测动作、姿势、手势、表情、镜头、视角、构图、布局、背景、场景、"
+    "光照、色调、材质、文字、特效或画风。最终动作、镜头、构图、场景和画风只服从本次任务的文字方案；"
+    "用户文字明确要求的换装、动作或画风优先于参考图。"
+)
+
+
 def _string(description: str = "") -> dict:
     return {"type": "string", "maxLength": 8000, "description": description}
 
@@ -34,7 +43,8 @@ IMAGE_ROLE_SCHEMA = {
     "required": ["source", "role"],
     "properties": {
         "source": _string("input:1 等本条/引用图片序号，或 prepare_character_reference 返回的标识"),
-        "role": {"type": "string", "enum": ["character", "style", "edit"]},
+        "role": {"type": "string", "enum": ["character", "style", "edit"],
+                 "description": "character 只取人物稳定外观；style 仅为兼容保留，不读取画风；edit 为编辑原图"},
         "character_id": _string("人物参考必须绑定人物 id"),
     },
 }
@@ -145,7 +155,8 @@ def normalize_task(task: dict, base: dict | None = None) -> dict:
 
 
 def task_context(task: dict, base: dict | None, bindings: list[dict]) -> str:
-    payload = {"本次任务": task, "输入图片顺序及用途": bindings}
+    payload = {"本次任务": task, "输入图片顺序及用途": bindings,
+               "参考图使用约束": REFERENCE_FEATURE_GUIDANCE}
     if base:
         payload["目标作品"] = {"实际提示词": base["prompt"], "任务": base["task"]}
     return json.dumps(payload, ensure_ascii=False)

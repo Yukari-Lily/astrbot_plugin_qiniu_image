@@ -229,9 +229,9 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(pipeline_module, "rewrite", AsyncMock(return_value="只改花音，其余保留")), patch.object(pipeline_module, "visual_json", AsyncMock(return_value={"status": "ok", "issues": []})):
             output, _ = await self.plugin.pipeline.draw(self.event, "只改花音", frozen)
         self.assertEqual(output, B64)
-        self.assertEqual(self.plugin._generate.await_args.args[2], ["base64://" + B64])
+        self.assertEqual(self.plugin._generate.await_args.args[2], [])
 
-    async def test_five_references_reach_optimizer_and_image_api(self):
+    async def test_five_references_reach_optimizer_but_not_image_api(self):
         task = group_task()
         for char in task["characters"]:
             char["reference_id"] = self.reference(char)["id"]
@@ -242,11 +242,23 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             output, note = await self.plugin.pipeline.draw(self.event, "五人同框", frozen)
         self.assertEqual(output, B64)
         self.assertEqual(len(compile_mock.await_args.kwargs["image_urls"]), 5)
-        self.assertEqual(len(self.plugin._generate.await_args.args[2]), 5)
+        self.assertEqual(self.plugin._generate.await_args.args[2], [])
         self.assertEqual(len(check_mock.await_args.kwargs["image_urls"]), 6)
         self.assertIn("中间人物发饰", note)
         self.plugin._generate.assert_awaited_once()
         self.assertEqual(self.plugin.pipeline.store.get(("group", "alice"), frozen["id"])["assessment"]["status"], "issues")
+
+    async def test_style_reference_is_hidden_from_optimizer_and_image_api_without_input(self):
+        style_ref = self.reference(character())["id"]
+        task = {"operation": "create", "characters": [character()],
+                "image_roles": [{"source": style_ref, "role": "style"}]}
+        frozen = self.plugin.pipeline.freeze(self.event, task)
+        compile_mock = AsyncMock(return_value="只使用文字方案的新构图")
+        with patch.object(pipeline_module, "rewrite", compile_mock):
+            output, _ = await self.plugin.pipeline.draw(self.event, "新构图", frozen)
+        self.assertEqual(output, B64)
+        self.assertEqual(compile_mock.await_args.kwargs["image_urls"], [])
+        self.assertEqual(self.plugin._generate.await_args.args[2], [])
 
     async def test_explicit_character_reference_is_not_edit(self):
         event = Event(segments=[Image(file="base64://" + B64)])
@@ -256,6 +268,7 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
             output, _ = await self.plugin.pipeline.draw(event, "参考人物画新图", self.plugin.pipeline.freeze(event, task))
         self.assertEqual(output, B64)
         self.assertFalse(mock.await_args.kwargs["has_image"])
+        self.assertEqual(self.plugin._generate.await_args.args[2], ["base64://" + B64])
         row = self.plugin.pipeline.store.get(("group", "alice"))
         self.assertTrue(row["task"]["characters"][0]["reference_id"].startswith("ref_"))
         self.assertFalse(row["assets"][0]["binding"]["source"].startswith("input:"))
