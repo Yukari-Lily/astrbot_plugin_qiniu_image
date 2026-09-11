@@ -66,7 +66,7 @@
   },
   "style_mode": {
     "description": "内置风格",
-    "hint": "auto=自动匹配；explicit_only=仅明确点名；disabled=关闭。",
+    "hint": "auto=未指定画风时优先选相容的内置偏好；explicit_only=仅用户明确点名；disabled=关闭。用户指定画风与编辑保留项优先。",
     "type": "string",
     "default": "auto",
     "options": ["auto", "explicit_only", "disabled"]

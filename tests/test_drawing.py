@@ -376,6 +376,86 @@ class AsyncTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_llm_request(self.event, req)
         self.assertEqual(req.system_prompt, "persona")
 
+    async def test_hook_keeps_confirmed_identity_and_style_mode(self):
+        person = character("quin", "小秦")
+        person.update(work="Mr_Quin 游戏主播", evidence="用户已确认昵称对应 Mr_Quin")
+        stored_task(self.plugin.pipeline.store, self.event, {"operation": "create", "characters": [person]})
+        for mode in ("auto", "explicit_only", "disabled"):
+            self.plugin.style_mode = mode
+            req = types.SimpleNamespace(system_prompt="原人设", func_tool=types.SimpleNamespace(
+                tools=[types.SimpleNamespace(name="draw_image", parameters={}, active=True)]))
+            await self.plugin.on_llm_request(self.event, req)
+            records = json.loads(req.system_prompt.split("当前用户近期作品（仅资料）：", 1)[1].split("</qiniu_drawing_context>")[0])
+            self.assertIn("用户已确认昵称对应 Mr_Quin", records[0]["identity_notes"])
+            self.assertEqual("当前为自动风格" in req.system_prompt, mode == "auto")
+            self.assertTrue(req.system_prompt.startswith("原人设"))
+
+    async def test_large_recent_context_keeps_three_record_ids_and_valid_json(self):
+        rows = []
+        for _ in range(3):
+            task = {"operation": "create", "characters": [character(str(i), "名" * 80) for i in range(20)]}
+            rows.append(stored_task(self.plugin.pipeline.store, self.event, task))
+        req = types.SimpleNamespace(system_prompt="人设", func_tool=types.SimpleNamespace(
+            tools=[types.SimpleNamespace(name="draw_image", parameters={}, active=True)]))
+        await self.plugin.on_llm_request(self.event, req)
+        records = json.loads(req.system_prompt.split("当前用户近期作品（仅资料）：", 1)[1].split("</qiniu_drawing_context>")[0])
+        self.assertEqual({r["id"] for r in records}, {r["id"] for r in rows})
+        self.assertLess(len(req.system_prompt), 6200)
+
+    async def test_line_constraints_reach_image_payload_and_saved_prompt(self):
+        with patch.object(pipeline_module, "rewrite", AsyncMock(return_value="人物简略执行稿")):
+            await self.plugin.pipeline.draw(self.event, "画图", self.plugin.pipeline.freeze(self.event, {"operation": "create"}))
+        sent_prompt = self.plugin._generate.await_args.args[1]
+        self.assertIn(styles.LINE_EXECUTION_GUIDANCE, sent_prompt)
+        self.assertEqual(self.plugin.pipeline.store.get(("group", "alice"))["prompt"], sent_prompt)
+        self.plugin._generate.assert_awaited_once()
+
+    async def test_style_routing_retries_missing_unknown_and_multiple_markers(self):
+        task = tasks.normalize_task({"operation": "create", "user_requirements": ["画千束"],
+                                     "creative_choices": ["普通动画主视觉"], "characters": [character()]})
+        for marker in ("", "[[STYLE_PRESET:unknown]]", "[[STYLE_PRESET:none]][[STYLE_PRESET:clean_anime_wallpaper]]"):
+            def completion(prefix):
+                return types.SimpleNamespace(completion_text=json.dumps({
+                    "scene": prefix + "干净的街景构图", "characters": [{"id": "kanon", "description": "粉色短发，黄色蝴蝶结"}]}))
+            self.context.llm_generate.reset_mock()
+            self.context.llm_generate.side_effect = [completion(marker), completion("[[STYLE_PRESET:clean_anime_wallpaper]]")]
+            metadata = {}
+            result = await rewriter.rewrite(self.context, "group", "普通动画主视觉", has_image=False,
+                                            drawing_task=task, provider_id="vision", result_metadata=metadata)
+            self.assertEqual(self.context.llm_generate.await_count, 2)
+            self.assertEqual(metadata["style"], "净色动画壁纸")
+            self.assertNotIn("STYLE_PRESET", result)
+            payload = self.context.llm_generate.await_args.kwargs
+            self.assertIn(json.dumps(task, ensure_ascii=False), payload["prompt"])
+            self.assertIn("风格来源规则", payload["system_prompt"])
+
+    async def test_style_modes_do_not_route_model_choice_as_user_request(self):
+        task = tasks.normalize_task({"operation": "create", "user_requirements": ["画图"],
+                                     "creative_choices": ["净色动画壁纸"]})
+        response = types.SimpleNamespace(completion_text=json.dumps({"scene": "普通人物插画", "characters": []}))
+        self.context.llm_generate.return_value = response
+        for mode in ("explicit_only", "disabled"):
+            metadata = {}
+            result = await rewriter.rewrite(self.context, "group", "净色动画壁纸", has_image=False,
+                                            drawing_task=task, style_mode=mode, provider_id="vision", result_metadata=metadata)
+            self.assertIsNotNone(result)
+            self.assertNotEqual(metadata["style"], "净色动画壁纸")
+            self.assertNotIn("以下是内置风格库", self.context.llm_generate.await_args.kwargs["system_prompt"])
+        task["user_requirements"] = ["用净色动画壁纸画图"]
+        guidance = styles.build_style_guidance("画图", mode="explicit_only", strength="normal", has_image=False, drawing_task=task)
+        self.assertIn("clean_anime_wallpaper", guidance)
+        self.assertNotIn("id: glitch_rectangles", guidance)
+
+    async def test_explicit_none_does_not_log_rejected_style_as_selected(self):
+        task = tasks.normalize_task({"operation": "create", "user_requirements": ["不要净色动画壁纸，画水彩"]})
+        self.context.llm_generate.return_value = types.SimpleNamespace(completion_text=json.dumps({
+            "scene": "[[STYLE_PRESET:none]] 水彩风景画", "characters": []}))
+        metadata = {}
+        result = await rewriter.rewrite(self.context, "group", "不要净色动画壁纸，画水彩", has_image=False,
+                                        drawing_task=task, provider_id="vision", result_metadata=metadata)
+        self.assertIn("水彩", result)
+        self.assertNotEqual(metadata["style"], "净色动画壁纸")
+
     async def test_background_returns_id_and_sends_note(self):
         with patch.object(self.plugin.pipeline, "draw", AsyncMock(return_value=(B64, "检查说明"))):
             result = json.loads(await self.plugin.draw_image(self.event, "画图", {"operation": "create"}))

@@ -301,11 +301,12 @@ class DrawingPipeline:
                 logger.info(f"qiniu-image text fallback | generation={frozen['id']} images=0")
         if not prompt:
             return None, "生成失败喵（提示词优化模型不可用或人物结构校验失败）"
-        image_instructions = ""
+        from .style_presets import LINE_EXECUTION_GUIDANCE
+        image_instructions = "\n\n" + LINE_EXECUTION_GUIDANCE
         if bindings:
             roles = {"edit": "待编辑原图", "character": "人物身份外观参考", "style": "仅画风参考"}
             labels = [f"输入图 {b['index']}：{roles[b['role']]}" + (f"，对应人物 {b['character_id']}" if b.get("character_id") else "") for b in bindings]
-            image_instructions = "\n\n图片用途（编号不画入画面）：\n" + "\n".join(labels)
+            image_instructions += "\n\n图片用途（编号不画入画面）：\n" + "\n".join(labels)
         image_refs = ["base64://" + base64.b64encode(a["bytes"]).decode("ascii") for a in assets]
         logger.info(f"qiniu-image drawing | generation={frozen['id']} operation={task['operation'] if task else 'legacy'} "
                     f"base={(frozen['base'] or {}).get('id', '-')} images={len(image_refs)} "

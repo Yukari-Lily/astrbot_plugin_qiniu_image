@@ -13,7 +13,7 @@ from .style_presets import (
     SAFE_REFRAME_GUIDANCE,
     build_style_guidance,
     clean_style_metadata,
-    find_explicit_presets,
+    valid_style_choice,
 )
 
 _MIN_LENGTH = 4
@@ -226,6 +226,7 @@ async def rewrite(
         mode=style_mode,
         strength=style_strength,
         has_image=has_image,
+        drawing_task=drawing_task,
     )
     instruction_parts = [
         PROMPT_OPTIMIZER_I2I if has_image else PROMPT_OPTIMIZER_T2I,
@@ -252,8 +253,12 @@ async def rewrite(
     task = f"输入的完整{'编辑' if has_image else '绘图'}方案：{user_prompt}"
     if evidence_context:
         task += "\n\n结构化任务与参考资料：\n" + evidence_context
+    elif drawing_task is not None:
+        task += "\n\n结构化任务：\n" + json.dumps(drawing_task, ensure_ascii=False)
 
     def plausible(candidate: str) -> bool:
+        if style_guidance and not valid_style_choice(candidate):
+            return False
         if drawing_task is not None:
             return len(candidate) <= _MAX_LENGTH and parse_compilation(candidate, drawing_task["characters"]) is not None
         return _plausible(clean_style_metadata(candidate)[0], user_prompt, has_image)
@@ -279,11 +284,11 @@ async def rewrite(
         compiled = parse_compilation(raw_text, drawing_task["characters"])
         raw_text = render_compilation(compiled, drawing_task["characters"])
 
-    mentioned_presets = find_explicit_presets(raw_text)
     text, marked_presets = clean_style_metadata(raw_text)
-    explicit_presets = find_explicit_presets(user_prompt)
-    selected = marked_presets or explicit_presets or mentioned_presets
-    style_name = "、".join(preset.name for preset in selected) or "未识别"
+    # The validated choice is authoritative, including none. A name mentioned
+    # in the proposal may have been rejected or only chosen by the chat model.
+    selected = marked_presets if style_guidance else ()
+    style_name = "、".join(preset.name for preset in selected) or "未使用内置风格"
     if result_metadata is not None:
         result_metadata["style"] = "、".join(preset.name for preset in selected) or "外部或未指定画风，见执行稿"
     logger.info(

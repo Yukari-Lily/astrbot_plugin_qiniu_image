@@ -24,7 +24,7 @@ CHARACTER_SCHEMA = {
         "version": _string("具体形象版本"),
         "position": _string("从观看者视角描述位置"),
         "features": _strings("有依据的标志性外观，不混入本轮换装要求"),
-        "evidence": _string("身份与外观依据；不能把搜索排名当作依据"),
+        "evidence": _string("分别说明身份指代与外观依据，可沿用用户确认、会话或目标作品已确认资料；陌生或冲突信息需搜索核实，不能把搜索排名当作依据"),
         "identity_status": {"type": "string", "enum": ["confirmed", "original", "uncertain"]},
         "reference_id": _string("prepare_character_reference 返回的标识；空字符串表示清除旧参考"),
     },

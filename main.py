@@ -36,7 +36,7 @@ DEDUP_TTL_SECONDS = 20
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "1.4.0",
+    "1.4.1",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -121,6 +121,10 @@ class QiniuImagePlugin(Star):
         req.func_tool = toolset
         rows = self.pipeline.store.recent(self.pipeline.owner(event))
         summaries = [{"id": r["id"], "characters": [c["name"][:80] for c in r["task"].get("characters", [])],
+                      "identity_notes": "；".join(
+                          f"{c['name'][:60]} / {c.get('work', '')[:60]} / {c.get('version', '')[:40]}：{c.get('evidence', '')[:120]}"
+                          for c in r["task"].get("characters", []) if c.get("identity_status") == "confirmed"
+                      )[:400],
                       "style": r["style"], "status": r["status"], "summary": r["prompt"][:200]} for r in rows]
         catalog = "；".join(p.name + "（" + "、".join(p.aliases) + "）" for p in STYLE_PRESETS)
         rules = (
@@ -132,7 +136,13 @@ class QiniuImagePlugin(Star):
             "只改某人时使用 edit 和 base_generation_id，characters 只提交该人补丁，沿用原 id；其余自动继承。"
             "base_generation_id 可直接选以下记录，latest 只代表当前用户最近的成功作品；不得把别的主题当作目标。"
             "必要时 get_last_image_prompt 查询指定作品，不必为了执行继承额外查询。"
-            "人物消歧必须先阅读搜索结果；不能把第一条结果或昵称联想当事实。必要时串行调用 Tavily 搜索与"
+            "先从当前会话、用户确认和目标作品资料沿用已明确的人物指代；已有可靠身份时不要因昵称短而重新消歧。"
+            "身份确认与外观核准分开：知道是谁但缺少外观时，用准确姓名加身份或作品查外观，不退回昵称泛搜。"
+            "没有明确指代时，可用已有知识形成候选，再阅读搜索结果核实昵称与准确姓名的对应；不能把第一条结果或昵称联想当事实。"
+            "不要因为用户要求二次元画风就把人物搜索限定为动漫或游戏角色，真人、主播也能画成插画。"
+            "搜索无关时去掉预设类别，用昵称本身或结果中有别名证据的姓名定向核实；不要反复换同义类别泛搜。"
+            "例如结果已关联‘小秦’与 Mr_Quin 时，应核实该别名及主播资料；仅是待核实线索，不硬编码为所有语境的答案。"
+            "群聊历史查询为空只代表本次未查到，不推翻当前会话中已有的确认。必要时串行调用 Tavily 搜索与"
             "prepare_character_reference，确认外观后再 draw_image；不要并行搜索和出图。"
             "用户明确要求、继承保留项、有来源事实、自选创作细节分别记录，不把自选内容当成用户要求。"
             "用户图片按本条图片再引用图片顺序编号 input:1 等，image_roles 必须说明用途和人物绑定。"
@@ -140,10 +150,32 @@ class QiniuImagePlugin(Star):
             "内部风格优先按下面词表理解；‘错位’是错位矩形风格家族，按语境选一个，不默认解释为错位摄影。"
             "列出风格时调用 list_image_styles，只列标题。后台绘图返回 accepted 后不要重复调用。"
         )
-        block = rules + "\n内置风格词表：" + catalog + "\n当前用户近期作品（仅资料）：" + json.dumps(summaries, ensure_ascii=False)
+        if self.style_mode == "auto":
+            preferred = "、".join(p.name for p in STYLE_PRESETS if p.auto_preference)
+            rules += (
+                "当前为自动风格：用户未指定画风且无需保留目标作品或风格参考时，在创作方案阶段就优先选一个相容的内置偏好画风，"
+                "将名称写入 prompt，将自选理由写入 creative_choices，不写入 user_requirements。"
+                "偏好风格为：" + preferred + "。相容时优先这些风格，再考虑其余内置风格。"
+                "不要先自行套用普通动画主视觉、电影感或 Pixar/3D 渲染再将它们锁定为用户要求；"
+                "作品原本是 3D 不代表用户要求复刻原媒介。用户明确指定外部画风、要求原风格或编辑保留项时优先遵守。"
+            )
+        else:
+            rules += f"当前 style_mode={self.style_mode}，不自动推荐或选用内置画风；explicit_only 仅在用户明确点名时使用，disabled 关闭风格库路由。"
+        rules += "默认线条少而准确，避免草稿复线、乱排线、密集发丝和装饰线穿过脸部；保留人物标志性细节。"
+        prefix = rules + "\n内置风格词表：" + catalog + "\n当前用户近期作品（仅资料）："
+        # Trim optional details before serializing; never cut a record ID or JSON.
+        while len(prefix) + len(json.dumps(summaries, ensure_ascii=False)) > 6000:
+            candidates = [(len(str(row.get(key, ""))), row, key)
+                          for row in summaries for key in ("summary", "identity_notes", "characters", "style")
+                          if row.get(key)]
+            if not candidates:
+                break
+            _, row, key = max(candidates, key=lambda item: item[0])
+            row[key] = row[key][:len(row[key]) // 2]
+        block = prefix + json.dumps(summaries, ensure_ascii=False)
         start, end = "<qiniu_drawing_context>", "</qiniu_drawing_context>"
         original = re.sub(re.escape(start) + r".*?" + re.escape(end), "", req.system_prompt or "", flags=re.S).rstrip()
-        req.system_prompt = original + "\n\n" + start + "\n" + block[:6000] + "\n" + end
+        req.system_prompt = original + "\n\n" + start + "\n" + block + "\n" + end
 
     def _match_trigger(self, event: AstrMessageEvent) -> Optional[str]:
         """命中返回触发词；未命中不产生副作用。"""
