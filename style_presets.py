@@ -247,7 +247,7 @@ def style_catalog_text(*, concise: bool = False) -> str:
     """供聊天工具与文档复用的风格目录，保持与实际预设同源。"""
     if concise:
         return "\n".join(
-            f"- {preset.name}：{preset.suitable_for}" for preset in STYLE_PRESETS
+            f"- {preset.name}" for preset in STYLE_PRESETS
         )
     return "\n".join(_catalog_lines(STYLE_PRESETS))
 
@@ -293,7 +293,7 @@ def clean_style_metadata(text: str) -> Tuple[str, Tuple[StylePreset, ...]]:
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"[^\S\r\n]{2,}", " ", cleaned).strip()
     return cleaned, tuple(selected)
 
 

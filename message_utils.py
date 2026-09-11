@@ -140,3 +140,25 @@ async def resolve_input_image(context: Any, event: Any, client: Any) -> Optional
     if reply_id in (None, "", 0):
         return None
     return await _image_from_get_msg(context, event, reply_id)
+
+
+async def resolve_input_images(context: Any, event: Any, client: Any) -> List[str]:
+    """Stable input:1..N ordering: direct images, then images in the quoted message."""
+    result: List[str] = []
+    segments = _segments(event)
+    reply = next((seg for seg in segments if isinstance(seg, Comp.Reply)), None)
+    quoted = list(getattr(reply, "chain", None) or [])
+    for seg in [*segments, *quoted]:
+        if isinstance(seg, Comp.Image):
+            reference = await _image_to_reference(seg, client)
+            if reference is None:
+                raise ValueError("输入图片无法读取，不能忽略该图片继续生成")
+            if reference not in result:
+                result.append(reference)
+    if reply and not any(isinstance(seg, Comp.Image) for seg in quoted):
+        reply_id = getattr(reply, "id", None)
+        if reply_id not in (None, "", 0):
+            reference = await _image_from_get_msg(context, event, reply_id)
+            if reference and reference not in result:
+                result.append(reference)
+    return result
