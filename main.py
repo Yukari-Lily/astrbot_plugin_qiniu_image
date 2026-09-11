@@ -1,4 +1,16 @@
-"""七牛 AI 绘图 / 改图插件。"""
+"""七牛 AI 绘图 / 改图插件。
+
+出图链路只有一条，且外观不经过任何模型转述：
+
+    draw_image(prompt, characters)
+        ↓ 插件按名字从外观缓存取记录（模型不传句柄）
+        ↓ 优化模型只写场景/动作/表情/构图
+        ↓ draw_task.assemble 把外观块逐字写进最终提示词
+        ↓ 出图（被拒则五级安全回退，回退后外观仍然在位）
+
+冷门角色的外观由 prepare_character_reference 取得，参考图**只用来产出文字**，
+永远不进绘图接口；只有用户自己发的图片才会作为图片输入送出去。
+"""
 
 import asyncio
 import copy
@@ -6,15 +18,19 @@ import json
 import re
 import time
 import traceback
-from typing import Dict, List, Optional, Set, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
-from .drawing_pipeline import DrawingPipeline
-from .drawing_task import DRAW_SCHEMA
+from . import appearance
+from .character_ref import CharacterReference, SafeFetcher
+from .draw_task import DRAW_SCHEMA, normalize_characters
+from .message_utils import resolve_input_images
+from .prompt_rewriter import SAFETY_REWRITE_LEVELS, rewrite, rewrite_for_safety
 from .qiniu_api import (
     QiniuApiError,
     QiniuAuthError,
@@ -31,12 +47,28 @@ from .qiniu_api import (
 from .style_presets import STYLE_MODES, STYLE_STRENGTHS, STYLE_PRESETS, style_catalog_text
 
 DEDUP_TTL_SECONDS = 20
+RECENT_PROMPT_LIMIT = 5
+
+#: 注入到系统提示词的作图约定。上限约 400 字：每轮对话都要付这份开销，
+#: 而"怎么消歧"属于工具描述该讲的事，不在这里重复。
+_DRAWING_RULES = (
+    "绘图前先结合用户要求、完整会话和你的人设形成方案；你负责创作，优化器只整理核对。"
+    "但写进 prompt 的方案必须自足：图片模型看不到这段对话，人名、作品、外观版本、"
+    "场景、动作和服饰都要写全，不能出现“刚才那张”“上一个”“她”这类指代。"
+    "不确定某个角色的外观时（冷门角色、原创人物、具体形象版本），先联网搜索它的资料页，"
+    "把网址交给 prepare_character_reference 取得准确外观，再调用 draw_image；必须串行，"
+    "不要并行，也不要为此追问用户。"
+    "用户本轮没有发图时，不得向图片模型传任何图片。"
+    "用户发了图时按 input:1 起编号；只有用户明确要求改动的地方才改，其余保持原样。"
+    "列出风格时调用 list_image_styles，只列标题。后台绘图返回 accepted 后不要重复调用。"
+    "身份或外观依据不足时简短说明无法可靠生成，不询问补图。"
+)
 
 @register(
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "1.4.1",
+    "2.0.0",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -70,36 +102,38 @@ class QiniuImagePlugin(Star):
             )
         self.style_strength = style_strength
 
+        # 搜索沿用 AstrBot 已有的联网能力：主聊天模型搜到来源网页后把网址交给
+        # 插件。插件自己不需要搜索密钥，只负责下载、核对与抽取。
+        self.fetcher = SafeFetcher()
+        self.references = CharacterReference(
+            context,
+            {"provider_id": self.rewrite_provider_id,
+             "fallback_provider_ids": self.rewrite_fallback_provider_ids},
+            fetcher=self.fetcher,
+        )
+
         self._recent_msg: Dict[str, float] = {}
         self._tasks: Set[asyncio.Task] = set()
-        self.pipeline = DrawingPipeline(self)
-        self._cleanup_task = None
+        self._last_prompts: "OrderedDict[str, List[dict]]" = OrderedDict()
 
         if not self.client.configured:
             logger.warning("qiniu-image: 未配置 api_key，插件已加载但无法出图")
 
-    async def initialize(self):
-        self._cleanup_task = asyncio.create_task(self._prune_cache())
-
-    async def _prune_cache(self):
-        while True:
-            await asyncio.sleep(60)
-            self.pipeline.store.prune()
-
     async def terminate(self):
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            await asyncio.gather(self._cleanup_task, return_exceptions=True)
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self.pipeline.close()
+        await self.fetcher.close()
         await self.client.close()
+
+    # ------------------------------------------------------------------
+    # 系统提示词注入
+    # ------------------------------------------------------------------
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
-        """Inject only bounded, relevant drawing context; preserve the system persona."""
+        """注入有限的作图约定与风格词表；不改写人设本身。"""
         toolset = getattr(req, "func_tool", None)
         tools = list(getattr(toolset, "tools", []) or [])
         draw = next((t for t in tools if t.name == "draw_image" and getattr(t, "active", True)), None)
@@ -114,72 +148,25 @@ class QiniuImagePlugin(Star):
                 tool = copy.copy(tool)
                 tool.parameters = copy.deepcopy(DRAW_SCHEMA)
                 toolset.tools[i] = tool
-            elif tool.name == "get_last_image_prompt":
-                tool = copy.copy(tool)
-                tool.parameters = {"type": "object", "properties": {"generation_id": {"type": "string", "description": "作品标识，缺省 latest"}}}
-                toolset.tools[i] = tool
         req.func_tool = toolset
-        rows = self.pipeline.store.recent(self.pipeline.owner(event))
-        summaries = [{"id": r["id"], "characters": [c["name"][:80] for c in r["task"].get("characters", [])],
-                      "identity_notes": "；".join(
-                          f"{c['name'][:60]} / {c.get('work', '')[:60]} / {c.get('version', '')[:40]}：{c.get('evidence', '')[:120]}"
-                          for c in r["task"].get("characters", []) if c.get("identity_status") == "confirmed"
-                      )[:400],
-                      "style": r["style"], "status": r["status"], "summary": r["prompt"][:200]} for r in rows]
+
         catalog = "；".join(p.name + "（" + "、".join(p.aliases) + "）" for p in STYLE_PRESETS)
-        rules = (
-            "绘图前结合用户当前要求、完整会话和你的人设形成方案；主聊天模型负责创作，优化器只整理核对。"
-            "draw_image 的 task 应区分 create 新画、edit 局部修改、redraw 整张重画；"
-            "图片角色为 character 人物参考、style 图片绑定或 edit 编辑原图，不能见图就改图；style 图片不作为画风依据。"
-            "人物参考图只用于身份和稳定外观特征：发型、发色、脸部、发饰、服装结构和配色；"
-            "不得从参考图带入动作、姿势、手势、表情、镜头、视角、构图、背景、光照或画风。"
-            "用户原消息没有 input 图片时，最终 draw_image 不得向图片模型传任何图片；"
-            "主模型可继续把参考图核对出的外观写入 characters.features/evidence，动作、构图和画风必须来自文字方案。"
-            "人物列表逐人填写 id/name/work/version/position/features/evidence/identity_status；"
-            "confirmed 需要可靠身份外观依据，原创人物用 original，不确定用 uncertain 并停止绘图。"
-            "只改某人时使用 edit 和 base_generation_id，characters 只提交该人补丁，沿用原 id；其余自动继承。"
-            "base_generation_id 可直接选以下记录，latest 只代表当前用户最近的成功作品；不得把别的主题当作目标。"
-            "必要时 get_last_image_prompt 查询指定作品，不必为了执行继承额外查询。"
-            "先从当前会话、用户确认和目标作品资料沿用已明确的人物指代；已有可靠身份时不要因昵称短而重新消歧。"
-            "身份确认与外观核准分开：知道是谁但缺少外观时，用准确姓名加身份或作品查外观，不退回昵称泛搜。"
-            "没有明确指代时，可用已有知识形成候选，再阅读搜索结果核实昵称与准确姓名的对应；不能把第一条结果或昵称联想当事实。"
-            "不要因为用户要求二次元画风就把人物搜索限定为动漫或游戏角色，真人、主播也能画成插画。"
-            "搜索无关时去掉预设类别，用昵称本身或结果中有别名证据的姓名定向核实；不要反复换同义类别泛搜。"
-            "例如结果已关联‘小秦’与 Mr_Quin 时，应核实该别名及主播资料；仅是待核实线索，不硬编码为所有语境的答案。"
-            "群聊历史查询为空只代表本次未查到，不推翻当前会话中已有的确认。必要时串行调用 Tavily 搜索与"
-            "prepare_character_reference，确认外观后再 draw_image；不要并行搜索和出图。"
-            "用户明确要求、继承保留项、有来源事实、自选创作细节分别记录，不把自选内容当成用户要求。"
-            "用户图片按本条图片再引用图片顺序编号 input:1 等，image_roles 必须说明用途和人物绑定。"
-            "身份外观依据不足时简短说明无法可靠生成，不询问补图、不等待回复；有可靠文字依据但取图失败可文字生成。"
-            "内部风格优先按下面词表理解；‘错位’是错位矩形风格家族，按语境选一个，不默认解释为错位摄影。"
-            "列出风格时调用 list_image_styles，只列标题。后台绘图返回 accepted 后不要重复调用。"
-        )
+        block = f"{_DRAWING_RULES}\n内置风格词表：{catalog}"
         if self.style_mode == "auto":
             preferred = "、".join(p.name for p in STYLE_PRESETS if p.auto_preference)
-            rules += (
-                "当前为自动风格：用户未指定画风且无需保留目标作品原有画风时，在创作方案阶段就优先选一个相容的内置偏好画风，"
-                "将名称写入 prompt，将自选理由写入 creative_choices，不写入 user_requirements。"
-                "偏好风格为：" + preferred + "。相容时优先这些风格，再考虑其余内置风格。"
-                "不要先自行套用普通动画主视觉、电影感或 Pixar/3D 渲染再将它们锁定为用户要求；"
-                "作品原本是 3D 不代表用户要求复刻原媒介。用户明确指定外部画风、要求原风格或编辑保留项时优先遵守。"
-            )
-        else:
-            rules += f"当前 style_mode={self.style_mode}，不自动推荐或选用内置画风；explicit_only 仅在用户明确点名时使用，disabled 关闭风格库路由。"
-        rules += "默认线条少而准确，避免草稿复线、乱排线、密集发丝和装饰线穿过脸部；保留人物标志性细节。"
-        prefix = rules + "\n内置风格词表：" + catalog + "\n当前用户近期作品（仅资料）："
-        # Trim optional details before serializing; never cut a record ID or JSON.
-        while len(prefix) + len(json.dumps(summaries, ensure_ascii=False)) > 6000:
-            candidates = [(len(str(row.get(key, ""))), row, key)
-                          for row in summaries for key in ("summary", "identity_notes", "characters", "style")
-                          if row.get(key)]
-            if not candidates:
-                break
-            _, row, key = max(candidates, key=lambda item: item[0])
-            row[key] = row[key][:len(row[key]) // 2]
-        block = prefix + json.dumps(summaries, ensure_ascii=False)
+            block += f"\n自动风格：未指定画风时优先选一个相容的内置偏好画风，偏好为：{preferred}。"
+        recent = self._last_prompts.get(self._owner(event)) or []
+        if recent:
+            rows = "；".join(f"{row['id']}（{row['style']}）" for row in reversed(recent))
+            block += f"\n近期作品：{rows}。需要原文时调用 get_last_image_prompt。"
+
         start, end = "<qiniu_drawing_context>", "</qiniu_drawing_context>"
         original = re.sub(re.escape(start) + r".*?" + re.escape(end), "", req.system_prompt or "", flags=re.S).rstrip()
         req.system_prompt = original + "\n\n" + start + "\n" + block + "\n" + end
+
+    # ------------------------------------------------------------------
+    # 触发词直出（不经过聊天模型）
+    # ------------------------------------------------------------------
 
     def _match_trigger(self, event: AstrMessageEvent) -> Optional[str]:
         """命中返回触发词；未命中不产生副作用。"""
@@ -219,7 +206,7 @@ class QiniuImagePlugin(Star):
             return
 
         prompt = (event.message_str or "").strip()[len(trigger):].strip()
-        image_b64, error_text = await self._draw(event, prompt)
+        image_b64, error_text = await self._draw(event, prompt, (), {})
         if image_b64:
             components = [Comp.Image.fromBase64(image_b64)]
             if error_text:
@@ -228,50 +215,87 @@ class QiniuImagePlugin(Star):
         else:
             yield event.plain_result(error_text or "生成失败喵")
 
-    @filter.llm_tool(name="draw_image")
-    async def draw_image(self, event: AstrMessageEvent, prompt: str, task: Optional[dict] = None):
-        """按完整方案和结构化任务绘图，后台完成后自动发图，不要重复调用。
+    # ------------------------------------------------------------------
+    # 工具
+    # ------------------------------------------------------------------
 
-        结合人设和会话区分本轮要求、保留项、人物事实及自选细节。
-        edit 局部修改；redraw 整张重画；create 新画。task.base_generation_id 自动继承目标，
-        无需先调用 get_last_image_prompt。人物不确定时先串行搜索并核对，不猜测、不追问补图。
-        只有旧调用不传 task 才沿用见图改图。多人必须提供逐人资料和位置。
+    @filter.llm_tool(name="draw_image")
+    async def draw_image(self, event: AstrMessageEvent, prompt: str,
+                         characters: Optional[list] = None):
+        """按完整方案绘图，后台完成后自动发图，不要重复调用。
+
+        你负责创作：结合用户本轮要求、Bot 人设、完整会话与必要考据写出完整方案。
+        不确定某个角色长什么样时，先调用 prepare_character_reference，再调用本工具；
+        人物的发型、发色、瞳色、服装等外观由插件自动注入，不要在 prompt 里重复描述，
+        也不要自己编造，写了会被丢弃。多人必须逐人给出位置并逐人描述。
 
         Args:
-            prompt(string): 结合用户要求、Bot 人设、完整会话和必要考据形成的完整方案。
-            task(object): 结构化任务，可省略以兼容旧调用；具体字段见参数 schema。
+            prompt(string): 结合用户要求、Bot 人设、完整会话和必要考据形成的完整方案，含动作、表情、场景、构图、光照与画风。必须自足——图片模型看不到这段对话，人名、场景、动作要写全，不要出现“刚才那张”“她”这类指代。
+            characters(array[object]): 画面中的具名人物。每项含 name（准确名称）、work（所属作品）、version（形象版本）、position（从观看者视角看的位置，多人必填）。纯风景或不含具名角色时可省略。
         """
         if not self.client.configured:
             return "生成失败喵（未配置 api_key）"
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 32000:
             return "生成失败喵（绘图方案为空或过长）"
         try:
-            frozen = self.pipeline.freeze(event, task)
-        except (ValueError, OSError) as exc:
+            people = normalize_characters(characters)
+        except ValueError as exc:
             return f"绘图任务未提交：{exc}。不要猜测或询问补图。"
-        worker = asyncio.create_task(self._draw_and_push(event, prompt.strip(), frozen))
+
+        # 外观在提交时同步取出：prepare_character_reference 刚写进缓存，这里必中；
+        # 缓存在后台任务开始前就定型，也不受后续请求影响。
+        # 缓存项是含来源信息的整包，这里只取 appearance 本身；只注入通过覆盖度
+        # 校验的记录，宁可不用也不能把半真半假的外观锚点写进提示词。
+        appearances: Dict[str, Any] = {}
+        for char in people:
+            entry = self.references.lookup(char["name"], char["work"], char["version"])
+            record = entry.get("appearance") if isinstance(entry, dict) else None
+            if appearance.is_usable(record):
+                appearances[char["id"]] = record
+        unknown = [char["name"] for char in people if char["id"] not in appearances]
+        if unknown:
+            logger.info(f"qiniu-image: 以下人物没有可用外观记录，按纯文字生成｜{'、'.join(unknown)}")
+
+        worker = asyncio.create_task(self._draw_and_push(event, prompt.strip(), people, appearances))
         self._tasks.add(worker)
         worker.add_done_callback(self._tasks.discard)
-        return json.dumps({"status": "accepted", "generation_id": frozen["id"],
-                           "message": "后台生成中，完成后自动发送；不要重复调用。"}, ensure_ascii=False)
+        return json.dumps({"status": "accepted", "message": "后台生成中，完成后自动发送；不要重复调用。"},
+                          ensure_ascii=False)
 
     @filter.llm_tool(name="prepare_character_reference")
-    async def prepare_character_reference(self, event: AstrMessageEvent, subject: str,
-                                          source_urls: List[str], evidence: str):
-        """从搜索结果网页或图片直链核对人物参考图，不负责搜索。先确定人物及版本，不按搜索排名猜身份。
-        先等待本工具结果，再调用 draw_image。失败不追问补图，仅在已有充分文字依据时继续。
+    async def prepare_character_reference(self, event: AstrMessageEvent, name: str,
+                                          source_urls: Optional[list] = None,
+                                          work: str = "", version: str = ""):
+        """查询角色的准确外观：你负责搜索，插件负责下载、核对与提取。
+
+        当你不确定某个角色长什么样，或用户提到的是冷门角色、原创人物、某个具体形象
+        版本时：先用你的联网搜索找到该角色的资料页或图片地址，再把搜索结果网址填入
+        source_urls 调用本工具。下载、选图、核对与外观提取全部由插件完成。
+        结果会把外观写入插件缓存，随后 draw_image 会自动使用，你不需要复述外观。
+        本工具不返回网址。查不到时会明确告知，此时不要编造外观。
 
         Args:
-            subject(string): 已消歧的人物准确名称、作品或身份、形象版本。
-            source_urls(array[string]): 1 至 3 个 Tavily 结果网页、图片地址或本条/引用图片标识 input:1 等。
-            evidence(string): 搜索得到的人物身份依据和外观线索，说明为何不是同名人物。
+            name(string): 角色的准确名称，例如「小秦」。
+            source_urls(array[string]): 1 至 4 个搜索结果网页或图片直链；不要填你无法访问的地址。
+            work(string): 所属作品、系列或身份，用于区分同名角色，可省略。
+            version(string): 具体形象版本，例如某代立绘、某种服装，可省略。
         """
+        urls = [url for url in (source_urls or []) if isinstance(url, str)]
         try:
-            result = await self.pipeline.prepare_reference(event, subject, source_urls, evidence)
+            result = await self.references.prepare(
+                event.unified_msg_origin, name, work, version, urls
+            )
         except (ValueError, OSError, asyncio.TimeoutError) as exc:
-            logger.warning(f"qiniu-image reference failed | error={type(exc).__name__}")
-            result = {"status": "unavailable", "reason": "来源或图片不可用，未完成参考核对",
-                      "instruction": "有充分文字依据时可继续，否则结束；不追问补图。"}
+            logger.warning(f"qiniu-image: 角色外观查询失败（{type(exc).__name__}: {exc}）")
+            result = {"status": "unavailable", "reason": "来源或图片不可用，未完成外观核对",
+                      "instruction": "不要编造外观；有可靠文字依据时可继续，否则简短说明无法可靠生成。"}
+        except Exception as exc:
+            logger.error(
+                f"qiniu-image: 角色外观查询异常｜error_type={type(exc).__name__}\n"
+                + "".join(traceback.format_tb(exc.__traceback__))
+            )
+            result = {"status": "unavailable", "reason": "外观查询异常",
+                      "instruction": "不要编造外观；有可靠文字依据时可继续，否则简短说明无法可靠生成。"}
         return json.dumps(result, ensure_ascii=False)
 
     @filter.llm_tool(name="list_image_styles")
@@ -281,31 +305,52 @@ class QiniuImagePlugin(Star):
 
     @filter.llm_tool(name="get_last_image_prompt")
     async def get_last_image_prompt(self, event: AstrMessageEvent, generation_id: str = "latest"):
-        """读取当前会话当前用户的指定成功作品；缺省读取最近作品，不用于其他用户的作品。
+        """读取当前会话当前用户的近期作品原文；缺省读取最近一次，不用于其他用户的作品。
 
         Args:
             generation_id(string): 指定作品标识或 latest，可省略。
         """
-        try:
-            record = self.pipeline.store.get(self.pipeline.owner(event), generation_id)
-        except ValueError:
-            return "当前用户没有可读取的对应作品，可能尚未完成或已过期。不能据此猜测旧作品。"
-        return json.dumps({"generation_id": record["id"], "task": record["task"],
-                           "actual_prompt": record["prompt"], "assessment": record["assessment"]}, ensure_ascii=False)
+        rows = self._last_prompts.get(self._owner(event)) or []
+        if not rows:
+            return "当前用户没有可读取的近期作品。不能据此猜测旧作品。"
+        if generation_id in (None, "", "latest"):
+            record = rows[-1]
+        else:
+            record = next((row for row in rows if row["id"] == generation_id), None)
+            if record is None:
+                return "当前用户没有可读取的对应作品。不能据此猜测旧作品。"
+        return json.dumps({"generation_id": record["id"], "prompt": record["prompt"],
+                           "style": record["style"], "characters": record["characters"]},
+                          ensure_ascii=False)
 
-    async def _draw_and_push(
-        self,
-        event: AstrMessageEvent,
-        prompt: str,
-        frozen=None,
-    ) -> None:
+    # ------------------------------------------------------------------
+    # 出图
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _owner(event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}:{event.get_sender_id()}"
+
+    def _remember(self, event: AstrMessageEvent, prompt: str, style: str,
+                  characters: Sequence[Dict[str, str]]) -> None:
+        owner = self._owner(event)
+        rows = self._last_prompts.pop(owner, [])
+        rows.append({
+            "id": f"g{int(time.time() * 1000) % 10 ** 9}",
+            "prompt": prompt[:4000],
+            "style": style or "未使用内置风格",
+            "characters": [char["name"] for char in characters],
+        })
+        self._last_prompts[owner] = rows[-RECENT_PROMPT_LIMIT:]
+        while len(self._last_prompts) > 200:
+            self._last_prompts.popitem(last=False)
+
+    async def _draw_and_push(self, event: AstrMessageEvent, prompt: str,
+                             characters: Sequence[Dict[str, str]],
+                             appearances: Dict[str, Any]) -> None:
         """后台出图并推送。"""
         try:
-            image_b64, error_text = await self._draw(
-                event,
-                prompt,
-                frozen,
-            )
+            image_b64, error_text = await self._draw(event, prompt, characters, appearances)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -327,8 +372,59 @@ class QiniuImagePlugin(Star):
         except Exception as exc:
             logger.error(f"qiniu-image: 推送结果失败（{type(exc).__name__}: {exc}）")
 
-    async def _draw(self, event: AstrMessageEvent, user_prompt: str, frozen=None):
-        return await self.pipeline.draw(event, user_prompt, frozen)
+    async def _draw(self, event: AstrMessageEvent,
+                    user_prompt: str,
+                    characters: Sequence[Dict[str, str]],
+                    appearances: Dict[str, Any]):
+        """一次完整出图：解析输入图 → 优化场景 → 拼装外观 → 出图（含安全回退）。"""
+        try:
+            image_refs = await resolve_input_images(self.context, event, self.client)
+        except ValueError as exc:
+            return None, f"生成失败喵（{exc}）"
+
+        metadata: Dict[str, Any] = {}
+        text = await rewrite(
+            self.context,
+            event.unified_msg_origin,
+            user_prompt,
+            has_image=bool(image_refs),
+            characters=characters,
+            appearances=appearances,
+            style_mode=self.style_mode,
+            style_strength=self.style_strength,
+            provider_id=self.rewrite_provider_id,
+            fallback_provider_ids=self.rewrite_fallback_provider_ids,
+            image_urls=image_refs,
+            result_metadata=metadata,
+        )
+        if not text:
+            return None, "生成失败喵（提示词优化失败）"
+
+        for attempt in range(1, SAFETY_REWRITE_LEVELS + 1):
+            try:
+                image_b64, error_text = await self._generate(event, text, image_refs)
+            except QiniuSafetyError:
+                if attempt == SAFETY_REWRITE_LEVELS:
+                    return None, "生成失败喵（内容审核未通过）"
+                logger.warning(f"qiniu-image: 被审核拒绝，进入安全回退 {attempt}/{SAFETY_REWRITE_LEVELS}")
+                replacement = await rewrite_for_safety(
+                    self.context,
+                    event.unified_msg_origin,
+                    text,
+                    provider_id=self.rewrite_provider_id,
+                    fallback_provider_ids=self.rewrite_fallback_provider_ids,
+                    safety_attempt=attempt + 1,
+                    characters=characters,
+                    appearances=appearances,
+                )
+                if not replacement:
+                    return None, "生成失败喵（内容审核未通过）"
+                text = replacement
+                continue
+            if image_b64:
+                self._remember(event, text, str(metadata.get("style", "")), characters)
+            return image_b64, error_text
+        return None, "生成失败喵"
 
     async def _generate(
         self,
