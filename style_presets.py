@@ -13,16 +13,6 @@ CLEAN_LINE_GUIDANCE = """
 动画画面清洁度约束：以 large simple color masses、low visual frequency、restrained edge density、clear edge hierarchy、minimal internal contour lines、broad shadow shapes 组织画面。外轮廓明确，内部结构线少而准确；头发先分大束，衣物只保留解释体积所需的主要褶皱，每种材质用少量连续的大块明暗表现。抑制微纹理和微对比（suppress micro-texture and micro-contrast），避免碎阴影、密集发丝、细碎反光、无必要的镜面高光（no unnecessary specular highlights）、排线和脏灰过渡。背景云层、建筑和水面概括为少量大形，细节与对比低于主体；拼贴使用少量大窗口及充分留白，避免重复人脸、密集小窗和装饰碎片抢夺焦点。干净来自形体概括与细节取舍，不靠锐化或堆叠 highly detailed。明确要求雕刻、半调或故障时仅在局部保留必要特征；局部改图只约束修改区域，保持其他区域原貌。
 """.strip()
 
-# Also sent directly to the image model so compression by the optimizer cannot
-# remove the execution constraint. Explicit styles and unchanged edit areas win.
-LINE_EXECUTION_GUIDANCE = (
-    "线条执行约束（不画成文字）：在不违背用户明确画风及保留项的前提下，"
-    "轮廓使用单次、准确、连续的线条；消除草稿复线、杂乱排线、密集碎发线、放射速度线与无意义装饰线。"
-    "头发按大束、衣褶按少量主要转折、阴影按大块组织；减少高频背景和碎片，脸部与人物交界保持清晰。"
-    "不删除辨识人物所需的发饰、服装结构和标志物；明确要求雕刻或线性特效时仅在必要区域有序使用，"
-    "局部编辑仅约束本次修改部分，其余保持原貌。"
-)
-
 
 QUALITY_GUIDANCE = """
 全局审美与质量底线（无论是否选用内置风格都必须遵守）：
@@ -33,7 +23,7 @@ QUALITY_GUIDANCE = """
 5. 日系动漫、漫画或游戏角色使用官方日文作品名和角色名；画内需要标题或装饰文字时只使用准确的官方日文原文，或输入方案明确指定的文字，不使用中文译名或中文装饰字。不要擅自添加无意义文字。
 6. 若题材不是二次元人物（例如商品、美食、建筑或输入方案明确要求摄影），选择适合题材的专业视觉语言，但仍保持干净、克制和清晰层级。
 7. “masterpiece、best quality、highly detailed、anime style、cinematic、8k、插画、高清”等只是泛化质量词，不属于输入方案指定的完整画风，不能用它们作为跳过内置风格的理由。
-""".strip() + "\n" + CLEAN_LINE_GUIDANCE + "\n" + LINE_EXECUTION_GUIDANCE
+""".strip() + "\n" + CLEAN_LINE_GUIDANCE
 
 
 SAFE_REFRAME_GUIDANCE = """
@@ -101,8 +91,7 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         avoid_when="传统绘画、自然写实摄影、安静简约且不希望出现数字噪点的画面",
         prompt=(
             "故障艺术与赛博朋克动漫美学，多个错位矩形窗口和几何切片形成数字碎片化构图；加入像素排序、RGB色偏、"
-            "局部横向色带和少量边缘色偏，故障限于背景与窗口边缘，不覆盖人脸或变成密集电流乱线；"
-            "以极简米白背景对比高饱和湛蓝天空和厚重积雨云，氛围超现实、忧郁而深邃。"
+            "横向拉伸噪点和彩虹电流纹理，以极简米白背景对比高饱和湛蓝天空和厚重积雨云，氛围超现实、忧郁而深邃。"
         ),
         auto_preference=2,
     ),
@@ -114,7 +103,7 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         avoid_when="写实商业摄影、厚重暗黑、追求三维体积和复杂写实光照的画面",
         prompt=(
             "二次元平面艺术插画，采用窗口重叠与数字拼贴构图；以多个错位矩形框重构角色轮廓，局部透明视窗显露清朗"
-            "蓝天和积雨云，仅用少量黑色长条与克制边缘色偏，不铺满电子扫描线；克莱因蓝和纯白主色，动态姿态与干净单线轮廓，"
+            "蓝天和积雨云，点缀极简黑色长条、细密电子扫描线与克制色偏纹理；克莱因蓝和纯白主色，动态速写姿态，"
             "画面简洁明快、宁静且富有诗意。"
         ),
         auto_preference=2,
@@ -151,7 +140,7 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         avoid_when="需要写实空间纵深、复杂叙事场景、柔和低对比摄影",
         prompt=(
             "现代复古平面海报与 Risograph 半调网点印刷风格，主体居中，以深蓝和米白半调纹理表现；粗糙颗粒米色纸张"
-            "背景配明黄色几何实心拱门，周围仅点缀少量有序轨道弧线与品红四芒星，不叠加交错线网；上下使用复古粗体"
+            "背景配明黄色几何实心拱门，周围点缀极细交错轨道线、微小品红四芒星和条形码图形；上下使用复古粗体"
             "无衬线排版及黄色高光色块（仅排版用户实际要求呈现的文字），构图极简、色彩强烈，具有波普杂志封面的冲击力。"
         ),
         auto_preference=2,
@@ -164,7 +153,7 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         avoid_when="安静低饱和、古典工笔、写实摄影或严格极简留白",
         prompt=(
             "现代日系混合媒介插画，采用倒置动态构图与扁平波普逻辑；以高饱和明黄为主，克莱因蓝和大红强烈对冲，"
-            "以赛璐璐平涂和少量大块拼贴为主体，仅在背景局部使用半调波点或水墨喷溅，避免细碎喷溅和多层乱线；光影利落，"
+            "融合赛璐璐平涂、半调波点、水墨喷溅、纸张肌理和数码后期叠加，形成多层二维拼贴空间；光影利落，"
             "兼具都市轻盈感、瞬时爆发力和符号化视觉冲击。"
         ),
         auto_preference=2,
@@ -189,9 +178,8 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         avoid_when="自然写实姿态、古典场景、强调柔和体积光或复杂三维环境",
         prompt=(
             "极简平面化日系赛博流行插画，主体以失重倒立或悬浮姿势形成对角线动势；温暖奶油米色大面积留白中设置"
-            "红色或与主体主要衣物同色的巨大不规则有机色块，使服装边缘与色块无缝交融；色块内部安排少量白色电路节点与"
-            "清晰分支，保持节点间距，避免交叉线网和线条穿过人物面部；仅在用户要求时添加代码或符号，"
-            "使用干净赛璐璐平涂和清晰黑色线稿，呈现 Y2K 极客海报张力。"
+            "红色或与主体主要衣物同色的巨大不规则有机色块，使服装边缘与色块无缝交融；内部叠加白色线性电路节点、几何网状"
+            "分支、等宽代码与二进制符号，使用干净赛璐璐平涂和清晰黑色线稿，呈现 Y2K 极客海报张力。"
         ),
         auto_preference=2,
     ),
@@ -214,10 +202,10 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         suitable_for="沉思人物、意识流、梦境、极简与高密度细节并存的日系独立插画",
         avoid_when="写实摄影、厚涂三维、中心放射式爆炸或要求完全无颗粒的画面",
         prompt=(
-            "清透细腻的日系独立插画与超现实波普艺术，主体安静沉思，头部或发丝向上连接有层次的少量大块失重拼贴；"
-            "避免中心放射，以轮廓明确的建筑切片、少量流动丝带和几何块表现思维扩展，辅以少量十字四芒星，"
-            "不用密集碎片、细线建筑网或草稿复线。下方及四周保留大面积纯白负空间，以准确单线轮廓和无渐变赛璐璐平涂表现；"
-            "冰蓝、钴蓝为主，搭配芥末黄和淡土金，边缘干净，仅在背景局部保留轻微 Risograph 纸张肌理。"
+            "清透细腻的日系独立插画与超现实波普艺术，主体安静沉思，头部或发丝向上无缝解体为高密度失重碎片；"
+            "避免中心放射，使用相互垂直穿插的平面拼贴，组合极细线建筑切片、流动丝带曲线、锐利几何碎块和纤细"
+            "十字四芒星。下方及四周保留大面积纯白负空间，以 Ligne claire 极细线稿和无渐变赛璐璐平涂表现；"
+            "冰蓝、钴蓝为主，搭配芥末黄和淡土金，边缘干净，整体覆盖均匀复古噪点与 Risograph 纸张肌理。"
         ),
         auto_preference=2,
     ),
@@ -259,7 +247,7 @@ def style_catalog_text(*, concise: bool = False) -> str:
     """供聊天工具与文档复用的风格目录，保持与实际预设同源。"""
     if concise:
         return "\n".join(
-            f"- {preset.name}" for preset in STYLE_PRESETS
+            f"- {preset.name}：{preset.suitable_for}" for preset in STYLE_PRESETS
         )
     return "\n".join(_catalog_lines(STYLE_PRESETS))
 
@@ -268,12 +256,6 @@ _STYLE_MARKER_RE = re.compile(
     r"\[\[\s*STYLE_PRESET\s*:\s*([a-z0-9_-]+)\s*\]\]",
     re.IGNORECASE,
 )
-
-
-def valid_style_choice(text: str) -> bool:
-    """An enabled router must report one known choice, including explicit none."""
-    choices = _STYLE_MARKER_RE.findall(text)
-    return len(choices) == 1 and choices[0].casefold() in {"none", *(p.id for p in STYLE_PRESETS)}
 
 
 def clean_style_metadata(text: str) -> Tuple[str, Tuple[StylePreset, ...]]:
@@ -311,7 +293,7 @@ def clean_style_metadata(text: str) -> Tuple[str, Tuple[StylePreset, ...]]:
         cleaned,
         flags=re.IGNORECASE,
     )
-    cleaned = re.sub(r"[^\S\r\n]{2,}", " ", cleaned).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return cleaned, tuple(selected)
 
 
@@ -321,18 +303,12 @@ def build_style_guidance(
     mode: str,
     strength: str,
     has_image: bool,
-    drawing_task: dict | None = None,
 ) -> str:
     """构造给优化模型看的风格路由规则。"""
     if mode == "disabled":
         return ""
 
-    # For structured calls, explicit_only must not mistake a creative choice
-    # made by the chat model for a style explicitly requested by the user.
-    explicit_text = user_prompt
-    if drawing_task is not None and mode == "explicit_only":
-        explicit_text = "\n".join(drawing_task.get("user_requirements", []) + drawing_task.get("changes", []))
-    explicit = find_explicit_presets(explicit_text)
+    explicit = find_explicit_presets(user_prompt)
     if mode == "explicit_only" and not explicit:
         return ""
 
@@ -354,7 +330,7 @@ def build_style_guidance(
         "2. 输入方案明确给出具体且有辨识度的其他画风时，忠实保留并停止自动叠加内置风格。",
         "3. 输入方案由主聊天模型基于人设、上下文、角色考据和创作委托形成，其中确定的画风、构图及视觉选择必须保留。anime style、highly detailed、masterpiece、cinematic、插画、高清等泛化词不算具体风格。",
         "4. 输入方案未确定具体画风时，主动选择一个相容的内置风格；已有明确视觉方案时不要另套模板。方案要求换风格时参照其中记录的上一版风格选择不同方案；仅在完整风格与主体或硬性要求冲突时借用部分特征。",
-        "5. 自动选择时先从标记为‘自动偏好：高’的相容风格中选择一个；仅当高偏好项全部不相容才考虑普通项。只有用户明确要求其他具体画风、纯写实、忠实复刻原画风、不要风格化、或全部候选都明显冲突时才选择零个。图片本身不是画风来源。",
+        "5. 多个风格都适合时，优先选择标记为“自动偏好：高”的风格；只有输入方案明确要求纯写实、忠实复刻原画风、不要风格化，或全部候选都明显冲突时才选择零个。",
         "6. 最多选择一个风格，不混合多个内置风格。输入方案中的主体身份、品牌、商品、数量、动作、场景、构图和配色等明确要求永远优先；方案要求画进图片的文字必须逐字保留。",
         "7. 只吸收所选风格中适用的视觉属性，不复制示例主体，不添加输入方案未包含的角色、品牌、文字或物件。",
         "8. 把所选风格的构图、色彩、线条、材质等视觉属性自然展开写入提示词；正文中绝对不要写出风格的中文名称、别名或 id，避免图片模型把名称画进画面。",
@@ -364,16 +340,6 @@ def build_style_guidance(
     ]
     if has_image:
         lines.append("12. 当前是改图：除非输入方案明确点名风格或要求整体重绘/风格化，否则不要改变原图画风。")
-    if drawing_task is not None and mode == "auto":
-        lines.append(
-            "结构化任务的风格来源规则优先于上文的‘方案确定画风必须保留’："
-            "user_requirements、changes 中用户明确指定的画风最高，随后是目标作品保留项；图片本身不提供画风依据。"
-            "prompt 或 creative_choices 中模型自行加入的普通动画主视觉、cinematic、Pixar/3D 等并非用户指定；"
-            "人物作品的原始媒介及形象版本也不自动锁定本图媒介。auto 模式下这些自选画风可让位于相容的内置偏好，"
-            "保留主体、动作、场景及已确定构图，仅调整相容的色彩组织、线条和材质。"
-            "只有上述更高优先级约束才可以阻止自动选风格；不要以自选普通画风为由输出 STYLE_PRESET:none。"
-            "不要把整份英文 prompt 当成用户原话。"
-        )
     if explicit:
         names = "、".join(preset.name for preset in explicit)
         lines.append(f"检测到输入方案可能明确提及：{names}。仍需识别否定语义，并以方案整体含义为准。")

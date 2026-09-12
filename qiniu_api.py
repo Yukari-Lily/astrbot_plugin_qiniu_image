@@ -287,16 +287,10 @@ class QiniuImageClient:
 
     async def image_to_image(self, image: str, prompt: str) -> List[str]:
         """图生图（编辑），image 为 http(s) URL 或 base64:// 形式。"""
-        return await self.images_to_image([image], prompt)
-
-    async def images_to_image(self, images: List[str], prompt: str) -> List[str]:
-        """有序多图输入；图片编号和用途由 prompt 明确绑定。"""
         if not self.configured:
             raise QiniuNotConfiguredError("未配置 api_key")
-        if not images:
-            raise QiniuInputError("图片列表不能为空")
         payload = self._base_payload(prompt)
-        payload["images"] = [{"image_url": self.as_image_reference(image)} for image in images]
+        payload["images"] = [{"image_url": self.as_image_reference(image)}]
 
         async with self._semaphore:
             session = await self._get_session()
