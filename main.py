@@ -439,13 +439,8 @@ class QiniuImagePlugin(Star):
 
     @filter.llm_tool(name="list_image_styles")
     async def list_image_styles(self, event: AstrMessageEvent):
-        """查询本插件实际可用的内置绘图风格。当用户询问你会哪些画风、支持哪些风格、推荐什么画风或要求列出风格时，调用此工具获取最新目录。"""
-        yield event.plain_result(
-            "本插件的内置绘图风格如下。回答用户时使用中文名称，不要编造目录外的内置风格。\n"
-            f"当前模式：{self.style_mode}；强度：{self.style_strength}。\n\n"
-            "函数绘图 auto 偏好：单人/单主体优先错位矩形、诗意窗口等；多人/多主体优先净色动画壁纸。明确指定画风优先。下方为基础目录。\n"
-            f"{style_catalog_text(concise=True)}"
-        )
+        """查询本插件实际可用的内置绘图风格。当用户询问你会哪些画风、支持哪些风格、推荐什么画风或要求列出风格时，调用此工具获取最新目录。列出可用风格时只列中文标题，每行一个，不添加说明、配置或推荐语，不编造目录外的内置风格。"""
+        yield event.plain_result(style_catalog_text(concise=True))
 
     @filter.llm_tool(name="get_last_image_prompt")
     async def get_last_image_prompt(self, event: AstrMessageEvent, full: bool = False):

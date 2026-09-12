@@ -244,10 +244,10 @@ def _catalog_lines(presets: Sequence[StylePreset]) -> List[str]:
 
 
 def style_catalog_text(*, concise: bool = False) -> str:
-    """供聊天工具与文档复用的风格目录，保持与实际预设同源。"""
+    """供聊天工具与文档复用的风格目录，精简模式只列标题。"""
     if concise:
         return "\n".join(
-            f"- {preset.name}：{preset.suitable_for}" for preset in STYLE_PRESETS
+            f"- {preset.name}" for preset in STYLE_PRESETS
         )
     return "\n".join(_catalog_lines(STYLE_PRESETS))
 
