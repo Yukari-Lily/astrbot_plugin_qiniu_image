@@ -12,7 +12,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .message_utils import resolve_input_image
-from .prompt_integrator import integrate
+from .prompt_integrator import integrate, integrate_fallback
 from .prompt_rewriter import SAFETY_REWRITE_LEVELS, rewrite, rewrite_for_safety
 from .drawing_planner import DrawingPlanner, SEARCH_TOOLS
 from .qiniu_api import (
@@ -32,7 +32,9 @@ from .style_presets import STYLE_MODES, STYLE_STRENGTHS, style_catalog_text
 
 DEDUP_TTL_SECONDS = 20
 _SILENT_DRAWING = "qiniu_image_silent_drawing"
-PLANNING_TOOL_TIMEOUT_SECONDS = 55
+_FALLBACK_DRAWING = "qiniu_image_fallback_submissions"
+PLANNING_TOOL_TIMEOUT_SECONDS = 40
+INTEGRATION_TIMEOUT_SECONDS = 20
 
 _DRAWING_RULES = """
 绘图时先调用 prepare_drawing：交代用户原话、意图、必要人设/指代、硬性要求及允许自由设计的部分。
@@ -41,6 +43,7 @@ style_request 仅填写用户明确说出的画风原话；用户只说画某角
 规划模型会从内置目录选风格再设计画面。用户要求恢复自动选风格时 style_request 填 auto；普通内容修改留空沿用旧风格。
 独立规划模型负责搜索、特征核对和动作构图。检查返回的摘要，不满意则带 base_plan_id 提修改意见；
 确认符合委托后调用 draw_image(plan_id, caption)，不要并行准备与出图，也不用额外询问用户批准。
+规划达到时限或核对失败时插件会停止搜索并直接受理出图；prepare_drawing 返回 accepted 时不要重新规划或重复提交。
 caption 由你用当前主 Bot 人格写一句自然的短回复，简单说画谁即可，不写工整的场景解说，不复述摘要。
 例如猫娘人格可说“这次画元气千束喵～”，其他人格用自己的口吻，不统一加喵；不要声称图片已完成。
 新收到“再画乙/画乙”是新增请求，不会自动取消之前的甲；逐份检查并提交，不能漏掉已准备方案。
@@ -57,7 +60,7 @@ pending_review 表示还有未提交的方案，先检查并 draw_image；只有
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "2.2.3",
+    "2.2.4",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -186,7 +189,7 @@ class QiniuImagePlugin(Star):
     async def prepare_drawing(self, event: AstrMessageEvent, brief: str,
                               base_plan_id: str = "", use_last: bool = False,
                               image_mode: str = "auto", style_request: str = ""):
-        """静默委托独立模型规划绘图，返回内部审核用的编号和摘要，不向用户播报进度。
+        """静默规划绘图，通常返回编号和摘要；超时或规划失败时停止核对并直接受理出图，返回 accepted。
 
         Args:
             brief(string): 用户意图、已解析的指代/必要人设、硬性要求和创作自由度；修改时写具体意见。
@@ -202,6 +205,10 @@ class QiniuImagePlugin(Star):
         if image_mode not in ("auto", "edit", "reference") or (base_plan_id and use_last):
             return "图片用途应为 auto/edit/reference；base_plan_id 与 use_last 不能同时使用。"
         owner = self._prompt_key(event)
+        fallback_key = json.dumps([brief.strip(), base_plan_id, use_last, image_mode, style_request.strip()], ensure_ascii=False)
+        submitted = event.get_extra(_FALLBACK_DRAWING, {})
+        if fallback_key in submitted:
+            return submitted[fallback_key]
         pending = self._pending_review(owner, exclude=base_plan_id)
         if pending:
             event.set_extra(_SILENT_DRAWING, True)
@@ -235,17 +242,37 @@ class QiniuImagePlugin(Star):
                 if image_mode == "auto" and image_ref:
                     image_mode = base["image_mode"]
             event.set_extra(_SILENT_DRAWING, True)
-            record = await asyncio.wait_for(self.planner.prepare(
-                event, owner, brief.strip(), image_ref=image_ref,
+            planning_options = dict(image_ref=image_ref,
                 vision_ref=self.client.as_image_reference(image_ref) if image_ref else None,
                 image_mode=image_mode, previous_prompt=previous_prompt,
                 search_tools=self._search_tools.get(owner, ()),
                 style_mode=self.style_mode, style_request=style_request.strip(),
                 previous_style_id=previous_style_id,
-            ), timeout=PLANNING_TOOL_TIMEOUT_SECONDS)
+            )
+            fallback_state = {}
+            try:
+                record = await asyncio.wait_for(self.planner.prepare(
+                    event, owner, brief.strip(), fallback_state=fallback_state, **planning_options,
+                ), timeout=PLANNING_TOOL_TIMEOUT_SECONDS)
+            except Exception as exc:
+                reason = "规划超时，已停止搜索和核对" if isinstance(exc, asyncio.TimeoutError) else "规划未能完成有效核对，已停止继续重试"
+                logger.warning(f"qiniu-image planning fallback | umo={event.unified_msg_origin} cause={type(exc).__name__}")
+                record = await self.planner.prepare_fallback(
+                    event, owner, brief.strip(), state=fallback_state, reason=reason, **planning_options,
+                )
             if base and base["status"] == "ready":
                 base["status"] = "superseded"
             logger.info(f"qiniu-image plan ready | umo={event.unified_msg_origin} plan_id={record['plan_id']} style_id={record['style_id']} search_count={len(record['research'])}")
+            if record.get("degraded"):
+                accepted = await self.draw_image(event, record["plan_id"], caption="按你的要求画一张。")
+                if self.client.configured:
+                    accepted = json.loads(accepted)
+                    accepted.update(degraded=True, limitation=record["degraded_reason"])
+                    accepted = json.dumps(accepted, ensure_ascii=False)
+                    submitted = dict(event.get_extra(_FALLBACK_DRAWING, {}))
+                    submitted[fallback_key] = accepted
+                    event.set_extra(_FALLBACK_DRAWING, submitted)
+                return accepted
             result = self.planner.describe(record)
             result["instruction"] = "静默检查摘要；需修改则重新准备，符合委托后调用 draw_image(plan_id, caption)，caption 用你当前人格自然地说画谁。收到新增请求也要先处理这份方案。"
             return json.dumps(result, ensure_ascii=False)
@@ -321,14 +348,24 @@ class QiniuImagePlugin(Star):
         """Keep provider fallbacks outside AstrBot's tool timeout, with exactly one caption."""
         try:
             selection = {}
-            final_prompt = await integrate(
-                self.context, event.unified_msg_origin, record["prompt"], has_image=bool(record["image_ref"]),
-                image_mode=record["image_mode"] if record["image_ref"] else "auto",
-                style_mode=self.style_mode, style_strength=self.style_strength,
-                provider_id=self.rewrite_provider_id, fallback_provider_ids=self.rewrite_fallback_provider_ids,
-                selection_out=selection,
-                planned_style_id=record["style_id"],
-            )
+            final_prompt = None
+            if not record.get("degraded"):
+                try:
+                    final_prompt = await asyncio.wait_for(integrate(
+                        self.context, event.unified_msg_origin, record["prompt"], has_image=bool(record["image_ref"]),
+                        image_mode=record["image_mode"] if record["image_ref"] else "auto",
+                        style_mode=self.style_mode, style_strength=self.style_strength,
+                        provider_id=self.rewrite_provider_id, fallback_provider_ids=self.rewrite_fallback_provider_ids,
+                        selection_out=selection,
+                        planned_style_id=record["style_id"],
+                    ), timeout=INTEGRATION_TIMEOUT_SECONDS)
+                except Exception as exc:
+                    logger.warning(f"qiniu-image integration fallback | plan_id={record['plan_id']} cause={type(exc).__name__}")
+            if not final_prompt:
+                final_prompt = integrate_fallback(
+                    record["prompt"], has_image=bool(record["image_ref"]), image_mode=record["image_mode"],
+                    planned_style_id=record["style_id"], selection_out=selection,
+                )
             if not final_prompt:
                 record["status"] = "failed"
                 await self._push_text(event, "生成失败喵（提示词整合暂时不可用）")

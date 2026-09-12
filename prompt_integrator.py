@@ -169,3 +169,22 @@ async def integrate(context, umo, prompt, *, has_image, image_mode="auto",
     if text and selection_out is not None:
         selection_out.update(parse_model_json(result[0]))
     return text
+
+
+def integrate_fallback(prompt, *, has_image, image_mode, planned_style_id, selection_out=None):
+    """Assemble the selected core style locally when optional model integration stalls."""
+    style_id = "none" if STYLE_HEADER in prompt else planned_style_id
+    if style_id not in (*STYLE_PARTS, "none"):
+        return None
+    selection = {
+        "image_mode": image_mode if has_image else "none", "style_id": style_id,
+        "style_parts": STYLE_CORE_PARTS.get(style_id, []),
+        "quality_parts": [] if QUALITY_HEADER in prompt else [0],
+        "none_reason": "existing_style" if STYLE_HEADER in prompt else "external_style",
+    }
+    text = _assemble(selection, prompt, has_image=has_image, image_mode=image_mode,
+                     allowed=STYLE_PARTS, planned_style_id=planned_style_id)
+    if text and selection_out is not None:
+        selection_out.clear()
+        selection_out.update(selection, fallback=True)
+    return text
