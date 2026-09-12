@@ -32,35 +32,32 @@ from .style_presets import STYLE_MODES, STYLE_STRENGTHS, style_catalog_text
 
 DEDUP_TTL_SECONDS = 20
 _SILENT_DRAWING = "qiniu_image_silent_drawing"
-_FALLBACK_DRAWING = "qiniu_image_fallback_submissions"
-PLANNING_TOOL_TIMEOUT_SECONDS = 40
+_DRAWING_SUBMISSIONS = "qiniu_image_submissions"
+PREPARATION_TIMEOUT_SECONDS = 45
 INTEGRATION_TIMEOUT_SECONDS = 20
 
 _DRAWING_RULES = """
-绘图时先调用 prepare_drawing：交代用户原话、意图、必要人设/指代、硬性要求及允许自由设计的部分。
-区分用户明确要求与你凭记忆补充的角色知识；后者标为待核实认识，不能写成用户指定的核心人设。
-style_request 仅填写用户明确说出的画风原话；用户只说画某角色时留空，不自行添加3D、厚涂、精细CG等风格。
-规划模型会从内置目录选风格再设计画面。用户要求恢复自动选风格时 style_request 填 auto；普通内容修改留空沿用旧风格。
-独立规划模型负责搜索、特征核对和动作构图。检查返回的摘要，不满意则带 base_plan_id 提修改意见；
-确认符合委托后调用 draw_image(plan_id, caption)，不要并行准备与出图，也不用额外询问用户批准。
-规划达到时限或核对失败时插件会停止搜索并直接受理出图；prepare_drawing 返回 accepted 时不要重新规划或重复提交。
-caption 由你用当前主 Bot 人格写一句自然的短回复，简单说画谁即可，不写工整的场景解说，不复述摘要。
-例如猫娘人格可说“这次画元气千束喵～”，其他人格用自己的口吻，不统一加喵；不要声称图片已完成。
-新收到“再画乙/画乙”是新增请求，不会自动取消之前的甲；逐份检查并提交，不能漏掉已准备方案。
-pending_review 表示还有未提交的方案，先检查并 draw_image；只有用户明确取消/替换才 cancel_drawing 或修改旧稿。
-修改上一张作品可用 use_last=true，让规划模型直接读取完整缓存；必要时用 get_drawing_plan(full=true)
-或 get_last_image_prompt(full=true) 查看全文和依据。默认只返回摘要，accepted 仅受理这一份，仍要处理其他绘图请求。
-整个绘图工具链静默执行：调用工具前后都不要发“稍等、正在规划、方案已确认、重试、后台加速”等过程消息，
-不要复述内部摘要或错误堆栈。完整提示词准备好后插件代发 caption 并发送图片，不另发可见回复。
-所有请求均已处理后，最终回复必须仅输出内部标记 QINIU_DRAWING_DONE，插件会隐藏它；不要返回空内容。
-失败时只简短说明失败原因，不要承诺已经在出图或“马上就来”。
+绘图只需调用 prepare_drawing，即刻受理并在后台规划、搜索和出图，无需再调用 draw_image。
+brief 只写用户明确的主体、动作、构图、文字、必要人设/指代和硬性要求，不把你凭记忆补充的角色外观写进去。
+对已有角色仅交代名称、作品及用户明确设定，外观知识由后台按需核实；原创主体完整保留用户设定。
+research_mode=skip 仅用于原创角色/场景或不依赖外部知识的请求；已有 IP 角色需要查外观时用 auto。
+style_request 只写用户明确要求的画风原话，未要求留空，恢复自动选风格填 auto；内容修改留空沿用旧风格。
+caption 用你当前人格自然地说一句画谁，60字以内；插件在提示词准备好后代发，不要声称已经画好。
+有图时 reference=参考创作，edit=局部修改，auto=按委托判断；明确局部改图无需联网核对。
+修改上一张作品用 use_last=true；修改指定任务用 base_plan_id，但正在生成图片的任务不能修改。
+每个新增请求分别调用 prepare_drawing，accepted 仅受理这一份。不要轮询、重复提交或等待审核摘要。
+只有用户明确取消时调用 cancel_drawing，允许取消尚未开始图片生成的后台任务。
+需要查看依据时调用 get_drawing_plan(full=true) 或 get_last_image_prompt(full=true)，默认只返回状态与摘要。
+整个绘图过程静默，不播报搜索、规划、确认、重试等过程消息。插件会发送 caption 和图片。
+所有请求受理完毕后最终只输出内部标记 QINIU_DRAWING_DONE，插件会隐藏它；不要返回空内容。
+受理失败时只简短说明原因，不承诺已经开始出图。
 """.strip()
 
 @register(
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "2.2.4",
+    "2.3.0",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -99,12 +96,17 @@ class QiniuImagePlugin(Star):
         self._last_image_prompts: Dict[str, Dict[str, object]] = {}
         self.planner = DrawingPlanner(context, str(config.get("planning_provider_id") or "").strip())
         self._search_tools = {}
-        self._preparing = set()
+        self._plan_tasks = {}
+        self._image_sources = {}
 
         if not self.client.configured:
             logger.warning("qiniu-image: 未配置 api_key，插件已加载但无法出图")
 
     async def terminate(self):
+        for plan_id in list(self._plan_tasks):
+            record = self.planner.plans.get(plan_id)
+            if record and record["status"] in ("planning", "integrating", "generating"):
+                self._cancel_plan(record)
         for task in list(self._tasks):
             task.cancel()
         if self._tasks:
@@ -171,11 +173,6 @@ class QiniuImagePlugin(Star):
     def _prompt_key(self, event):
         return json.dumps([str(event.unified_msg_origin), str(event.get_sender_id())])
 
-    def _pending_review(self, owner, exclude=""):
-        self.planner.prune()
-        return [self.planner.describe(record) for record in self.planner.plans.values()
-                if record["owner"] == owner and record["status"] == "ready" and record["plan_id"] != exclude]
-
     @filter.on_decorating_result()
     async def suppress_drawing_chatter(self, event):
         """Only suppress this drawing turn's LLM chatter; plugin deliveries bypass this hook."""
@@ -188,102 +185,147 @@ class QiniuImagePlugin(Star):
     @filter.llm_tool(name="prepare_drawing")
     async def prepare_drawing(self, event: AstrMessageEvent, brief: str,
                               base_plan_id: str = "", use_last: bool = False,
-                              image_mode: str = "auto", style_request: str = ""):
-        """静默规划绘图，通常返回编号和摘要；超时或规划失败时停止核对并直接受理出图，返回 accepted。
+                              image_mode: str = "auto", style_request: str = "",
+                              caption: str = "", research_mode: str = "auto"):
+        """立即受理绘图，返回任务编号；后台限时规划并自动发图，无需再调用 draw_image。
 
         Args:
-            brief(string): 用户意图、已解析的指代/必要人设、硬性要求和创作自由度；修改时写具体意见。
-            base_plan_id(string): 修改待审方案时填原方案编号，否则留空。
-            use_last(boolean): 修改上一张作品时为 true，规划模型直接读取完整提示词，无需复述。
-            image_mode(string): 有图时 reference=参考创作、edit=局部修改、auto=按委托判断。
-            style_request(string): 仅用户明确要求的画风原话，没有则留空；恢复自动选风格填 auto，不能凭角色原作补写3D或厚涂。
+            brief(string): 用户明确的主体、动作、构图、硬性要求和必要指代；不要添加记忆中的角色外观。
+            base_plan_id(string): 修改指定任务时填原编号，正在生成图片时不能修改。
+            use_last(boolean): 修改上一张作品时为 true，自动沿用完整提示词。
+            image_mode(string): reference=参考创作，edit=局部修改，auto=按委托判断。
+            style_request(string): 用户明确要求的画风原话，未要求留空，恢复自动填 auto。
+            caption(string): 按当前聊天人格说一句画谁，60字以内，由插件代发。
+            research_mode(string): auto=按需核实；skip=原创或无需外部知识的简单请求，不联网。
         """
+        if not self.client.configured:
+            return "生成失败喵（未配置 api_key）"
         if not isinstance(brief, str) or not 1 <= len(brief.strip()) <= 16000:
             return "请提供不超过16000字符的绘图委托。"
         if not isinstance(style_request, str) or len(style_request) > 1000:
             return "画风要求仅填写用户明确说出的原话，1000字以内。"
+        if not isinstance(caption, str) or len(caption.strip()) > 60:
+            return "caption 请用当前人格简单说画谁，60字以内。"
         if image_mode not in ("auto", "edit", "reference") or (base_plan_id and use_last):
             return "图片用途应为 auto/edit/reference；base_plan_id 与 use_last 不能同时使用。"
+        if research_mode not in ("auto", "skip"):
+            return "research_mode 应为 auto 或 skip。"
         owner = self._prompt_key(event)
-        fallback_key = json.dumps([brief.strip(), base_plan_id, use_last, image_mode, style_request.strip()], ensure_ascii=False)
-        submitted = event.get_extra(_FALLBACK_DRAWING, {})
-        if fallback_key in submitted:
-            return submitted[fallback_key]
-        pending = self._pending_review(owner, exclude=base_plan_id)
-        if pending:
-            event.set_extra(_SILENT_DRAWING, True)
-            return json.dumps({"status": "pending_review", "plans": pending,
-                               "instruction": "前面的绘图请求尚未提交。先检查这些摘要并逐份 draw_image(plan_id, caption)，再准备本次新增请求；只有用户明确取消时才 cancel_drawing。"}, ensure_ascii=False)
-        if owner in self._preparing:
-            event.set_extra(_SILENT_DRAWING, True)
-            return '{"status":"pending","instruction":"已有方案正在准备，请等待。"}'
-        self._preparing.add(owner)
+        request_key = json.dumps([brief.strip(), base_plan_id, use_last, image_mode, style_request.strip(), research_mode], ensure_ascii=False)
+        submitted = event.get_extra(_DRAWING_SUBMISSIONS, {})
+        if request_key in submitted:
+            return submitted[request_key]
+        previous_prompt, previous_style_id, base = "", "none", None
+        if base_plan_id:
+            base = self.planner.get(owner, base_plan_id)
+            if not base:
+                return "方案不存在、已过期或不属于当前用户。"
+            if base["status"] == "generating":
+                return "该方案正在出图，请等待完成再修改。"
+            previous_prompt = base.get("final_prompt") or base["prompt"]
+            previous_style_id = base["style_id"]
+        elif use_last:
+            last = self._last_image_prompts.get(owner)
+            if not last:
+                return "当前用户没有可沿用的提示词，请提交新的绘图委托。"
+            previous_prompt, previous_style_id = str(last["prompt"]), str(last.get("style_id", "none"))
+        options = dict(previous_prompt=previous_prompt, previous_style_id=previous_style_id,
+                       image_ref=base["image_ref"] if base else None,
+                       image_mode=(base["image_mode"] if base["image_ref"] else base.get("requested_image_mode", "auto"))
+                       if base and image_mode == "auto" else image_mode,
+                       style_mode=self.style_mode, style_request=style_request.strip())
         try:
-            previous_prompt = ""
-            previous_style_id = "none"
-            base = None
-            if base_plan_id:
-                base = self.planner.get(owner, base_plan_id)
-                if not base:
-                    return "方案不存在、已过期或不属于当前用户，请重新准备。"
-                if base["status"] in ("integrating", "generating"):
-                    return "该方案正在出图，请等待完成再修改。"
-                previous_prompt = base.get("final_prompt") or base["prompt"]
-                previous_style_id = base["style_id"]
-            elif use_last:
-                last = self._last_image_prompts.get(owner)
-                if not last:
-                    return "当前用户没有可沿用的提示词，请提交新的绘图委托。"
-                previous_prompt = str(last["prompt"])
-                previous_style_id = str(last.get("style_id", "none"))
-            image_ref = await resolve_input_image(self.context, event, self.client)
-            if base and not image_ref:
-                image_ref = base["image_ref"]
-                if image_mode == "auto" and image_ref:
-                    image_mode = base["image_mode"]
-            event.set_extra(_SILENT_DRAWING, True)
-            planning_options = dict(image_ref=image_ref,
-                vision_ref=self.client.as_image_reference(image_ref) if image_ref else None,
-                image_mode=image_mode, previous_prompt=previous_prompt,
-                search_tools=self._search_tools.get(owner, ()),
-                style_mode=self.style_mode, style_request=style_request.strip(),
-                previous_style_id=previous_style_id,
-            )
-            fallback_state = {}
-            try:
-                record = await asyncio.wait_for(self.planner.prepare(
-                    event, owner, brief.strip(), fallback_state=fallback_state, **planning_options,
-                ), timeout=PLANNING_TOOL_TIMEOUT_SECONDS)
-            except Exception as exc:
-                reason = "规划超时，已停止搜索和核对" if isinstance(exc, asyncio.TimeoutError) else "规划未能完成有效核对，已停止继续重试"
-                logger.warning(f"qiniu-image planning fallback | umo={event.unified_msg_origin} cause={type(exc).__name__}")
-                record = await self.planner.prepare_fallback(
-                    event, owner, brief.strip(), state=fallback_state, reason=reason, **planning_options,
-                )
-            if base and base["status"] == "ready":
-                base["status"] = "superseded"
-            logger.info(f"qiniu-image plan ready | umo={event.unified_msg_origin} plan_id={record['plan_id']} style_id={record['style_id']} search_count={len(record['research'])}")
-            if record.get("degraded"):
-                accepted = await self.draw_image(event, record["plan_id"], caption="按你的要求画一张。")
-                if self.client.configured:
-                    accepted = json.loads(accepted)
-                    accepted.update(degraded=True, limitation=record["degraded_reason"])
-                    accepted = json.dumps(accepted, ensure_ascii=False)
-                    submitted = dict(event.get_extra(_FALLBACK_DRAWING, {}))
-                    submitted[fallback_key] = accepted
-                    event.set_extra(_FALLBACK_DRAWING, submitted)
-                return accepted
-            result = self.planner.describe(record)
-            result["instruction"] = "静默检查摘要；需修改则重新准备，符合委托后调用 draw_image(plan_id, caption)，caption 用你当前人格自然地说画谁。收到新增请求也要先处理这份方案。"
-            return json.dumps(result, ensure_ascii=False)
+            record = self.planner.snapshot(owner, brief.strip(), state={}, **options)
+        except ValueError as exc:
+            return "受理失败：" + str(exc)
+        record.update(status="planning", caption=caption.strip() or "按你的要求画一张。",
+                      deadline=time.monotonic() + PREPARATION_TIMEOUT_SECONDS, research_mode=research_mode,
+                      requested_image_mode=options["image_mode"])
+        image_sources = (event,)
+        if base and not base["image_ref"]:
+            image_sources += tuple(source for source in self._image_sources.get(base["plan_id"], ()) if source is not event)
+        self._image_sources[record["plan_id"]] = image_sources
+        # Reserve the id and immutable request inputs before any provider or image I/O.
+        if base and base["status"] in ("ready", "planning", "integrating"):
+            self._cancel_plan(base, status="superseded")
+        search_tools = tuple(self._search_tools.get(owner, ())) if research_mode == "auto" else ()
+        task = asyncio.create_task(self._plan_and_push(event, record, options, search_tools, image_sources))
+        self._track_task(record, task)
+        event.set_extra(_SILENT_DRAWING, True)
+        accepted = json.dumps({"status": "accepted", "plan_id": record["plan_id"], "phase": "planning",
+                               "instruction": "本请求已受理，后台会自动发图；不要重复准备、提交或轮询。继续处理其他请求，全部受理后只输出 QINIU_DRAWING_DONE。"}, ensure_ascii=False)
+        submitted = dict(submitted)
+        submitted[request_key] = accepted
+        event.set_extra(_DRAWING_SUBMISSIONS, submitted)
+        logger.info(f"qiniu-image accepted | umo={event.unified_msg_origin} plan_id={record['plan_id']} phase=planning")
+        return accepted
+
+    def _track_task(self, record, task):
+        self._tasks.add(task)
+        self._plan_tasks[record["plan_id"]] = task
+
+        def done(completed):
+            self._tasks.discard(completed)
+            self._plan_tasks.pop(record["plan_id"], None)
+            self._image_sources.pop(record["plan_id"], None)
+
+        task.add_done_callback(done)
+
+    def _cancel_plan(self, record, status="cancelled"):
+        record["status"] = status
+        task = self._plan_tasks.get(record["plan_id"])
+        if task:
+            task.cancel()
+
+    @staticmethod
+    def _remaining(record):
+        return max(0, record.get("deadline", time.monotonic() + INTEGRATION_TIMEOUT_SECONDS) - time.monotonic())
+
+    async def _plan_and_push(self, event, record, options, search_tools, image_sources):
+        state = {}
+        try:
+            image_ref = None
+            for source in image_sources:
+                image_ref = await asyncio.wait_for(
+                    resolve_input_image(self.context, source, self.client), timeout=min(10, self._remaining(record)))
+                segments = source.get_messages() or []
+                supplied_image = any(isinstance(seg, Comp.Image) or
+                                     (isinstance(seg, Comp.Reply) and any(isinstance(part, Comp.Image)
+                                      for part in (getattr(seg, "chain", None) or []))) for seg in segments)
+                if supplied_image and not image_ref:
+                    raise ValueError("用户输入图片无法读取")
+                if image_ref:
+                    break
+            options = dict(options, image_ref=image_ref or options["image_ref"])
+            if options["image_mode"] in ("edit", "reference") and not options["image_ref"]:
+                raise ValueError("没有可用的输入图片")
+            self.planner.snapshot(record["owner"], record["brief"], state=state, record=record, **options)
+            direct_edit = bool(options["image_ref"]) and options["image_mode"] == "edit" and not options["style_request"]
+            record["fast_path"] = direct_edit or record["research_mode"] == "skip"
+            if not direct_edit:
+                try:
+                    await asyncio.wait_for(self.planner.prepare(
+                        event, record["owner"], record["brief"], fallback_state=state, target_record=record,
+                        vision_ref=self.client.as_image_reference(options["image_ref"]) if options["image_ref"] else None,
+                        search_tools=search_tools, no_research=not search_tools, **options,
+                    ), timeout=self._remaining(record))
+                except Exception as exc:
+                    # The snapshot is already usable; never start another model after the deadline.
+                    self.planner.snapshot(record["owner"], record["brief"], state=state, record=record, **options)
+                    record.update(degraded=True, degraded_reason="规划已停止，使用最新方案快照；未确认外观不作确定事实。")
+                    logger.warning(f"qiniu-image snapshot used | plan_id={record['plan_id']} revision={record['snapshot_revision']} cause={type(exc).__name__}")
+            if record["status"] in ("cancelled", "superseded"):
+                return
+            record["status"] = "integrating"
+            await self._integrate_and_push(event, record)
         except asyncio.CancelledError:
+            if record["status"] != "superseded":
+                record["status"] = "cancelled"
             raise
         except Exception as exc:
-            logger.warning(f"qiniu-image: 规划失败（{type(exc).__name__}）")
-            event.set_extra(_SILENT_DRAWING, False)
-            return "规划失败：" + (str(exc) if isinstance(exc, ValueError) else "规划模型或工具不可用/超时，请重试。")
-        finally:
-            self._preparing.discard(owner)
+            record["status"] = "failed"
+            logger.warning(f"qiniu-image preparation failed | plan_id={record['plan_id']} cause={type(exc).__name__}")
+            await self._push_text(event, "生成失败喵（输入图片或绘图方案不可用）")
 
     @filter.llm_tool(name="get_drawing_plan")
     async def get_drawing_plan(self, event: AstrMessageEvent, plan_id: str, full: bool = False):
@@ -300,22 +342,22 @@ class QiniuImagePlugin(Star):
 
     @filter.llm_tool(name="cancel_drawing")
     async def cancel_drawing(self, event: AstrMessageEvent, plan_id: str):
-        """仅在用户明确取消或替换请求时，取消尚未提交的方案；新增绘图不表示取消。
+        """仅在用户明确取消或替换请求时，取消尚未开始生成图片的后台任务；新增绘图不表示取消。
 
         Args:
-            plan_id(string): 用户明确不再需要的待审方案编号。
+            plan_id(string): 用户明确不再需要的任务编号。
         """
         record = self.planner.get(self._prompt_key(event), plan_id)
-        if not record or record["status"] != "ready":
-            return "只能取消当前用户尚未提交的待审方案。"
-        record["status"] = "cancelled"
+        if not record or record["status"] not in ("ready", "planning", "integrating"):
+            return "只能取消当前用户尚未开始图片生成的任务。"
+        self._cancel_plan(record)
         event.set_extra(_SILENT_DRAWING, True)
         return json.dumps({"status": "cancelled", "plan_id": plan_id,
                            "instruction": "继续处理其他请求；全部处理后仅输出 QINIU_DRAWING_DONE。"}, ensure_ascii=False)
 
     @filter.llm_tool(name="draw_image")
     async def draw_image(self, event: AstrMessageEvent, plan_id: str, caption: str = ""):
-        """静默确认并提交方案，立即返回；后台整合提示词和出图。不要另发确认、等待或重试消息。
+        """兼容旧待审方案的提交入口。prepare_drawing 已自动受理的任务无需调用，重复调用只返回状态。
 
         Args:
             plan_id(string): 已检查并符合用户委托的 prepare_drawing 方案编号。
@@ -339,8 +381,7 @@ class QiniuImagePlugin(Star):
         record["status"] = "integrating"
         logger.info(f"qiniu-image accepted | umo={event.unified_msg_origin} plan_id={plan_id}")
         task = asyncio.create_task(self._integrate_and_push(event, record))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._track_task(record, task)
         return json.dumps({"status": "accepted", "plan_id": plan_id, "phase": "integrating",
                            "instruction": "本方案已受理，不重复调用。继续处理尚未完成的其他绘图请求；全部处理后仅输出 QINIU_DRAWING_DONE 作为内部收尾，不能返回空内容。插件会代发 caption 和图片。"}, ensure_ascii=False)
 
@@ -349,7 +390,7 @@ class QiniuImagePlugin(Star):
         try:
             selection = {}
             final_prompt = None
-            if not record.get("degraded"):
+            if not record.get("degraded") and not record.get("fast_path") and self._remaining(record) > 0:
                 try:
                     final_prompt = await asyncio.wait_for(integrate(
                         self.context, event.unified_msg_origin, record["prompt"], has_image=bool(record["image_ref"]),
@@ -358,7 +399,7 @@ class QiniuImagePlugin(Star):
                         provider_id=self.rewrite_provider_id, fallback_provider_ids=self.rewrite_fallback_provider_ids,
                         selection_out=selection,
                         planned_style_id=record["style_id"],
-                    ), timeout=INTEGRATION_TIMEOUT_SECONDS)
+                    ), timeout=min(INTEGRATION_TIMEOUT_SECONDS, self._remaining(record)))
                 except Exception as exc:
                     logger.warning(f"qiniu-image integration fallback | plan_id={record['plan_id']} cause={type(exc).__name__}")
             if not final_prompt:
@@ -378,7 +419,8 @@ class QiniuImagePlugin(Star):
             await self._push_text(event, self._drawing_caption(record))
             await self._draw_and_push(event, final_prompt, image_ref=record["image_ref"], plan=record)
         except asyncio.CancelledError:
-            record["status"] = "cancelled"
+            if record["status"] != "superseded":
+                record["status"] = "cancelled"
             raise
         except Exception as exc:
             record["status"] = "failed"

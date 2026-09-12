@@ -388,201 +388,79 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
                                                        "rewrite_provider_ids": ["integrator"], "triggers": ["画图"]})
         self.plugin.client.text_to_image = AsyncMock(return_value=["generated"])
         self.plugin.client.image_to_image = AsyncMock(return_value=["edited"])
+        self.web = FunctionTool("web_search_tavily", "search", {})
+        self.plugin._search_tools[self.plugin._prompt_key(Event())] = (self.web,)
 
     async def asyncTearDown(self):
         await self.plugin.terminate()
 
     async def finish(self):
-        await asyncio.gather(*list(self.plugin._tasks))
+        await asyncio.wait_for(asyncio.gather(*list(self.plugin._tasks), return_exceptions=True), timeout=1)
 
-    async def prepare(self, event=None, **kwargs):
-        return json.loads(await self.plugin.prepare_drawing(event or Event(), "画甲，银发红瞳；动作自由设计", **kwargs))
+    async def accept(self, event=None, brief="画甲，动作自由设计", **kwargs):
+        return json.loads(await self.plugin.prepare_drawing(event or Event(), brief, **kwargs))
 
-    async def test_preparation_is_isolated_and_cannot_generate_until_main_approves(self):
+    async def test_acceptance_returns_before_any_io_and_auto_delivers(self):
         event = Event()
-        draft = await self.prepare(event)
-        self.assertEqual(draft["status"], "ready")
-        self.assertNotIn("prompt", draft)
+        accepted = await self.accept(event, caption="千束喵～")
+        self.assertEqual(accepted["status"], "accepted")
+        self.assertEqual(accepted["phase"], "planning")
+        self.ctx.tool_loop_agent.assert_not_awaited()
+        self.ctx.llm_generate.assert_not_awaited()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertIn("画甲", record["prompt"])
+        await self.finish()
+        self.assertEqual(record["status"], "completed")
         self.assertEqual(self.ctx.tool_loop_agent.call_args.kwargs["chat_provider_id"], "planner")
         self.assertEqual(self.ctx.tool_loop_agent.call_args.kwargs["contexts"], [])
-        self.assertNotIn("draw_image", [t.name for t in self.ctx.tool_loop_agent.call_args.kwargs["tools"].tools])
-        self.plugin.client.text_to_image.assert_not_awaited()
-        self.ctx.llm_generate.assert_not_awaited()
-        rejected = await self.plugin.draw_image(event, "直接画一个主体", caption="test caption~")
-        self.assertIn("prepare_drawing", rejected)
-        accepted = json.loads(await self.plugin.draw_image(event, draft["plan_id"], caption="test caption~"))
-        self.assertEqual(accepted["status"], "accepted")
-        self.assertNotIn("prompt", accepted)
-        await self.finish()
-        self.assertEqual(self.ctx.llm_generate.call_args.kwargs["chat_provider_id"], "integrator")
-        full = json.loads(await self.plugin.get_last_image_prompt(event, full=True))
-        self.plugin.client.text_to_image.assert_awaited_once_with(full["prompt"])
-        self.assertNotIn("prompt", json.loads(await self.plugin.get_last_image_prompt(event)))
-
-    async def test_single_subject_style_choice_reaches_image_and_followup(self):
-        event = Event()
-        self.ctx.tool_loop_agent.return_value = response({"prompt": "喜多挥手，几何窗口留白", "summary": "喜多；诗意窗口", "image_mode": "none", "style_id": "window_overlay_poetic"})
-        choice = selection(style="window_overlay_poetic")
-        choice["style_parts"] = [0, 1]
-        self.ctx.llm_generate.return_value = response(choice)
-        draft = await self.prepare(event)
-        self.assertEqual(draft["style_id"], "window_overlay_poetic")
-        await self.plugin.draw_image(event, draft["plan_id"], caption="喜多喵～")
-        await self.finish()
-        self.assertIn(integrator.STYLE_PARTS["window_overlay_poetic"][0], self.plugin.client.text_to_image.call_args.args[0])
-        self.assertEqual(json.loads(self.ctx.llm_generate.call_args.kwargs["prompt"])["planned_style_id"], "window_overlay_poetic")
-        await self.plugin.prepare_drawing(event, "只改成坐姿", use_last=True)
-        task = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])
-        self.assertTrue(task["preserve_previous_style"])
-        self.assertEqual(task["previous_style_id"], "window_overlay_poetic")
-        self.assertEqual(task["style_mode"], "auto")
-
-    async def test_explicit_single_person_wallpaper_remains_available(self):
-        draft = json.loads(await self.plugin.prepare_drawing(Event(), "画喜多", style_request="净色动画壁纸"))
-        self.assertEqual(draft["style_id"], "clean_anime_wallpaper")
-        self.assertEqual(json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])["style_request"], "净色动画壁纸")
-
-    async def test_followup_cannot_skip_unsubmitted_plan_and_bots_are_independent(self):
-        event = Event()
-        first = await self.prepare(event)
-        second = json.loads(await self.plugin.prepare_drawing(event, "再画喜多"))
-        self.assertEqual(second["status"], "pending_review")
-        self.assertEqual(second["plans"][0]["plan_id"], first["plan_id"])
-        self.ctx.tool_loop_agent.assert_awaited_once()
-        self.plugin.client.text_to_image.assert_not_awaited()
-        other_bot = Event()
-        other_bot.unified_msg_origin = "second-bot:group"
-        other = await self.prepare(other_bot)
-        self.assertEqual(other["status"], "ready")
-        await self.plugin.draw_image(event, first["plan_id"], caption="千束喵～")
-        second = json.loads(await self.plugin.prepare_drawing(event, "再画喜多"))
-        self.assertEqual(second["status"], "ready")
-        await self.plugin.draw_image(event, second["plan_id"], caption="再画个喜多喵")
-        await self.finish()
-        self.assertEqual(self.plugin.client.text_to_image.await_count, 2)
-
-    async def test_cancellation_releases_pending_plan_without_drawing(self):
-        event = Event()
-        draft = await self.prepare(event)
-        self.assertIn("只能取消", await self.plugin.cancel_drawing(Event(user="bob"), draft["plan_id"]))
-        result = json.loads(await self.plugin.cancel_drawing(event, draft["plan_id"]))
-        self.assertEqual(result["status"], "cancelled")
-        self.assertEqual((await self.prepare(event))["status"], "ready")
-        self.plugin.client.text_to_image.assert_not_awaited()
-
-    async def test_caption_comes_from_main_persona_and_is_sent_only_after_prompt_ready(self):
-        event = Event()
-        draft = await self.prepare(event)
-        rejected = json.loads(await self.plugin.draw_image(event, draft["plan_id"]))
-        self.assertEqual(rejected["status"], "ready")
-        self.assertFalse(self.plugin._tasks)
-        caption = "千束喵～元气满满的那种！"
-        accepted = json.loads(await self.plugin.draw_image(event, draft["plan_id"], caption=caption))
-        self.assertIn("QINIU_DRAWING_DONE", accepted["instruction"])
-        await self.finish()
-        self.assertEqual(self.ctx.send_message.call_args_list[0].args[1].text, caption)
-        self.ctx.llm_generate.assert_awaited_once()  # Only integration; no extra caption model.
-        full = json.loads(await self.plugin.get_drawing_plan(event, draft["plan_id"], full=True))
-        self.assertEqual(full["style_selection"]["style_id"], "clean_anime_wallpaper")
-        self.assertEqual(full["prompt"], self.plugin.client.text_to_image.call_args.args[0])
-
-    async def test_delivery_failure_is_not_marked_completed(self):
-        for failure in (False, RuntimeError("platform unavailable")):
-            event = Event()
-            draft = await self.prepare(event)
-            self.ctx.send_message.side_effect = [True, failure]
-            await self.plugin.draw_image(event, draft["plan_id"], caption="千束喵～")
-            await self.finish()
-            self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["status"], "delivery_failed")
-
-    async def test_revision_changes_id_and_supersedes_unapproved_draft(self):
-        event = Event()
-        first = await self.prepare(event)
-        second = await self.prepare(event, base_plan_id=first["plan_id"])
-        self.assertNotEqual(first["plan_id"], second["plan_id"])
-        previous = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])["previous_prompt"]
-        self.assertIn("银发红瞳", previous)
-        blocked = json.loads(await self.plugin.draw_image(event, first["plan_id"], caption="test caption~"))
-        self.assertEqual(blocked["status"], "superseded")
-        self.plugin.client.text_to_image.assert_not_awaited()
-
-    async def test_other_user_cannot_read_revise_or_execute_draft(self):
-        draft = await self.prepare()
-        bob = Event(user="bob")
-        self.assertIn("不属于", await self.plugin.get_drawing_plan(bob, draft["plan_id"], full=True))
-        self.assertIn("不属于", await self.plugin.prepare_drawing(bob, "修改", base_plan_id=draft["plan_id"]))
-        self.assertIn("有效方案编号", await self.plugin.draw_image(bob, draft["plan_id"], caption="test caption~"))
-        self.plugin.client.text_to_image.assert_not_awaited()
-
-    async def test_plan_is_single_use_even_after_completion(self):
-        draft = await self.prepare()
-        await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
-        await self.finish()
-        again = json.loads(await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~"))
-        self.assertEqual(again["status"], "completed")
-        self.plugin.client.text_to_image.assert_awaited_once()
-
-    async def test_expired_plan_is_rejected(self):
-        draft = await self.prepare()
-        record = self.plugin.planner.plans[draft["plan_id"]]
-        record["created"] -= planning.PLAN_TTL + 1
-        self.assertIn("有效方案编号", await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~"))
-
-    async def test_followup_loads_complete_prompt_inside_planner(self):
-        draft = await self.prepare()
-        await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
-        await self.finish()
-        full = json.loads(await self.plugin.get_last_image_prompt(Event(), full=True))["prompt"]
-        await self.plugin.prepare_drawing(Event(mid="2"), "只把坐姿改为站姿", use_last=True)
-        request = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])
-        self.assertEqual(request["previous_prompt"], full)
-        self.assertEqual(request["brief"], "只把坐姿改为站姿")
-
-    async def test_image_planning_has_no_tools_and_only_user_image(self):
-        self.ctx.llm_generate.side_effect = [response({"prompt": "以图中人物为依据，海边坐姿", "summary": "参考用户人物，海边坐姿", "image_mode": "reference"}),
-                                            response(selection("reference"))]
-        event = Event(images=[Image(url="https://example.com/user.png")])
-        draft = await self.prepare(event, image_mode="reference")
-        self.ctx.tool_loop_agent.assert_not_awaited()
-        vision = self.ctx.llm_generate.call_args.kwargs
-        self.assertEqual(vision["chat_provider_id"], "planner")
-        self.assertEqual(vision["image_urls"], ["https://example.com/user.png"])
-        self.assertNotIn("tools", vision)
-        # Executing from a later turn uses the reviewed image, not a different new attachment.
-        await self.plugin.draw_image(Event(images=[Image(url="https://example.com/different.png")]), draft["plan_id"], caption="test caption~")
-        await self.finish()
-        self.assertEqual(self.plugin.client.image_to_image.call_args.args[0], "https://example.com/user.png")
-        self.assertNotIn("image_urls", self.ctx.llm_generate.call_args.kwargs)
-
-    async def test_search_tool_scope_is_filtered_from_current_request(self):
-        web = FunctionTool("web_search_tavily", "search", {})
-        shell = FunctionTool("shell", "command", {})
-        disabled = FunctionTool("web_search_bocha", "search", {})
-        disabled.active = False
-        req = types.SimpleNamespace(system_prompt="人设", func_tool=ToolSet([web, shell, disabled]))
-        await self.plugin.on_llm_request(Event(), req)
-        await self.plugin.on_llm_request(Event(), req)
-        self.assertEqual(req.system_prompt.count(main._DRAWING_RULES), 1)
-        await self.prepare()
-        names = [tool.name for tool in self.ctx.tool_loop_agent.call_args.kwargs["tools"].tools]
-        self.assertEqual(names, ["web_search_tavily", "compare_subject_reference"])
-        self.assertNotIn("①", main._DRAWING_RULES)
-
-    async def test_failed_integration_uses_reviewed_plan_and_delivers_once(self):
-        draft = await self.prepare()
-        with patch.object(main, "integrate", AsyncMock(return_value=None)):
-            await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
-            await self.finish()
-        record = self.plugin.planner.plans[draft["plan_id"]]
-        self.assertEqual(record["status"], "completed")
-        self.assertTrue(record["final_prompt"].startswith(record["prompt"]))
-        self.assertIn(integrator.STYLE_PARTS[record["style_id"]][1], record["final_prompt"])
+        self.assertEqual(self.ctx.send_message.call_args_list[0].args[1].text, "千束喵～")
+        self.assertEqual(self.ctx.send_message.call_args_list[1].args[1].image, "generated")
         self.plugin.client.text_to_image.assert_awaited_once_with(record["final_prompt"])
-        self.assertEqual(self.ctx.send_message.await_count, 2)
-        self.assertEqual(self.ctx.send_message.call_args.args[1].image, "generated")
-        self.assertTrue(record["style_selection"]["fallback"])
+        self.assertNotIn("prompt", json.loads(await self.plugin.get_last_image_prompt(event)))
+        self.assertIn("prompt", json.loads(await self.plugin.get_drawing_plan(event, record["plan_id"], full=True)))
 
-    async def test_integration_timeout_cancels_model_and_delivers(self):
+    async def test_slow_image_resolution_does_not_block_tool_and_is_cancellable(self):
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def slow(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        event = Event()
+        with patch.object(main, "resolve_input_image", slow):
+            accepted = await asyncio.wait_for(self.accept(event), timeout=.1)
+            await started.wait()
+            result = json.loads(await self.plugin.cancel_drawing(event, accepted["plan_id"]))
+            await self.finish()
+        self.assertEqual(result["status"], "cancelled")
+        self.assertTrue(cancelled.is_set())
+        self.plugin.client.text_to_image.assert_not_awaited()
+        self.ctx.send_message.assert_not_awaited()
+
+    async def test_total_deadline_uses_snapshot_without_wrapup_model(self):
+        cancelled = asyncio.Event()
+
+        async def slow(**kwargs):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.ctx.tool_loop_agent.side_effect = slow
+        with patch.object(main, "PREPARATION_TIMEOUT_SECONDS", .03):
+            accepted = await self.accept(brief="画一只蓝色猫")
+            await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(record["degraded"])
+        self.assertEqual(record["status"], "completed")
+        self.assertIn("蓝色猫", record["final_prompt"])
+        self.ctx.llm_generate.assert_not_awaited()
+
+    async def test_integration_only_gets_remaining_total_budget(self):
         cancelled = asyncio.Event()
 
         async def slow(*args, **kwargs):
@@ -591,159 +469,367 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 cancelled.set()
 
-        draft = await self.prepare()
-        with patch.object(main, "integrate", slow), patch.object(main, "INTEGRATION_TIMEOUT_SECONDS", .01):
-            await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
-            await asyncio.wait_for(self.finish(), timeout=.5)
-        self.assertTrue(cancelled.is_set())
-        self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["status"], "completed")
-        self.plugin.client.text_to_image.assert_awaited_once()
+        async def plan(**kwargs):
+            await asyncio.sleep(.02)
+            return response({"prompt": "甲在海边招手", "summary": "甲", "image_mode": "none"})
 
-    async def test_slow_integration_returns_immediately_and_cannot_be_started_twice(self):
-        event = Event()
-        draft = await self.prepare(event)
-        record = self.plugin.planner.plans[draft["plan_id"]]
+        self.ctx.tool_loop_agent.side_effect = plan
+        with patch.object(main, "PREPARATION_TIMEOUT_SECONDS", .05), patch.object(main, "integrate", slow):
+            accepted = await self.accept()
+            await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertTrue(cancelled.is_set())
+        self.assertTrue(record["style_selection"]["fallback"])
+        self.assertEqual(record["status"], "completed")
+
+    async def test_completed_subjects_are_visible_before_deadline_and_survive_it(self):
+        first_saved, second_started, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        self.web.call = AsyncMock(return_value='{"url":"https://example.com/a","features":"银发红瞳"}')
+
+        async def run(**kwargs):
+            search, compare, save = kwargs["tools"].tools
+            await search.call(None, drawing_subject="甲", drawing_known_features="银发红瞳", query="甲")
+            saved = json.loads(await save.handler(Event(), "甲", "consistent", "银发红瞳", ["https://example.com/a"]))
+            self.assertEqual(saved["status"], "saved")
+            first_saved.set()
+            self.web.call.side_effect = slow_search
+            await search.call(None, drawing_subject="乙", drawing_known_features="猜测黑发金瞳", query="乙")
+
+        async def slow_search(*args, **kwargs):
+            second_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        self.ctx.tool_loop_agent.side_effect = run
+        with patch.object(main, "PREPARATION_TIMEOUT_SECONDS", .15):
+            accepted = await self.accept(brief="画甲和乙在海边合影")
+            await first_saved.wait()
+            await second_started.wait()
+            snapshot = json.loads(await self.plugin.get_drawing_plan(Event(), accepted["plan_id"], full=True))
+            self.assertEqual(snapshot["status"], "planning")
+            self.assertIn("银发红瞳", snapshot["prompt"])
+            self.assertNotIn("猜测黑发金瞳", snapshot["prompt"])
+            await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertTrue(cancelled.is_set())
+        self.assertIn("银发红瞳", record["final_prompt"])
+        self.assertNotIn("黑发金瞳", record["final_prompt"])
+        self.assertEqual(record["subject_assessments"][-1], {"subject": "乙", "relation": "unverified"})
+        self.ctx.llm_generate.assert_not_awaited()
+
+    async def test_conflict_check_updates_snapshot_even_if_next_model_step_hangs(self):
+        self.web.call = AsyncMock(return_value='{"url":"https://example.com/a"}')
+        self.ctx.llm_generate.return_value = response(consensus())
+
+        async def run(**kwargs):
+            search, compare, save = kwargs["tools"].tools
+            await search.call(None, drawing_subject="甲", drawing_known_features="银发红瞳", query="甲")
+            await compare.handler(Event(), "甲", "银发红瞳", "黑发金瞳", ["https://example.com/a"])
+            await asyncio.Event().wait()
+
+        self.ctx.tool_loop_agent.side_effect = run
+        with patch.object(main, "PREPARATION_TIMEOUT_SECONDS", .05), patch.object(references, "download_images", AsyncMock(return_value=evidence())):
+            accepted = await self.accept()
+            await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertIn("银发红瞳", record["final_prompt"])
+        self.assertEqual(record["checks"][0]["status"], "confirmed")
+        self.ctx.llm_generate.assert_awaited_once()  # Only the image comparison, never a wrapup.
+
+    async def test_simple_original_request_uses_one_model_and_no_search(self):
+        self.ctx.llm_generate.return_value = response({"prompt": "蓝色原创猫在窗边", "summary": "原创猫", "image_mode": "none"})
+        accepted = await self.accept(brief="原创蓝色猫", research_mode="skip")
+        await self.finish()
+        self.ctx.tool_loop_agent.assert_not_awaited()
+        self.ctx.llm_generate.assert_awaited_once()
+        self.assertNotIn("tools", self.ctx.llm_generate.call_args.kwargs)
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "completed")
+
+    async def test_saved_subject_can_finish_early_without_repeating_assessment(self):
+        self.web.call = AsyncMock(return_value='{"url":"https://example.com/a","features":"银发红瞳"}')
+
+        async def run(**kwargs):
+            search, compare, save = kwargs["tools"].tools
+            await search.call(None, drawing_subject="甲", drawing_known_features="银发红瞳", query="甲")
+            await save.handler(Event(), "甲", "consistent", "银发红瞳", ["https://example.com/a"])
+            return response({"prompt": "甲在海边招手", "summary": "甲在海边", "image_mode": "none"})
+
+        self.ctx.tool_loop_agent.side_effect = run
+        accepted = await self.accept()
+        await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertEqual(record["status"], "completed")
+        self.assertFalse(record.get("degraded"))
+        self.assertIn("银发红瞳", record["final_prompt"])
+        self.assertEqual(record["subject_assessments"][0]["relation"], "consistent")
+
+    async def test_checkpoint_rejects_invented_or_other_subject_sources(self):
+        self.web.call = AsyncMock(side_effect=['{"url":"https://example.com/a"}', '{"url":"https://example.com/b"}'])
+
+        async def run(**kwargs):
+            search, compare, save = kwargs["tools"].tools
+            await search.call(None, drawing_subject="甲", drawing_known_features="", query="甲")
+            await search.call(None, drawing_subject="乙", drawing_known_features="", query="乙")
+            for urls in (["https://example.com/invented"], ["https://example.com/b"]):
+                result = json.loads(await save.handler(Event(), "甲", "unknown", "假的金瞳", urls))
+                self.assertEqual(result["status"], "invalid")
+            result = json.loads(await compare.handler(Event(), "甲", "", "假的金瞳", ["https://example.com/b"]))
+            self.assertEqual(result["status"], "invalid_sources")
+            return response({"prompt": "invalid"})
+
+        self.ctx.tool_loop_agent.side_effect = run
+        accepted = await self.accept(brief="画甲和乙")
+        await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertNotIn("假的金瞳", record["final_prompt"])
+        self.assertTrue(all(row["relation"] == "unverified" for row in record["subject_assessments"]))
+
+    async def test_background_lifetime_survives_returning_tool_task(self):
         started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(**kwargs):
+            started.set()
+            await release.wait()
+            return response({"prompt": "甲在海边", "summary": "甲", "image_mode": "none"})
+
+        self.ctx.tool_loop_agent.side_effect = slow
+        caller = asyncio.create_task(self.accept())
+        accepted = await caller
+        await started.wait()
+        self.assertTrue(caller.done())
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "planning")
+        release.set()
+        await self.finish()
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "completed")
+
+    async def test_explicit_image_edit_needs_no_planning_or_integration_model(self):
+        event = Event(images=[Image(url="https://example.com/original.png")])
+        accepted = await self.accept(event, brief="只把帽子改蓝", image_mode="edit")
+        await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.ctx.tool_loop_agent.assert_not_awaited()
+        self.ctx.llm_generate.assert_not_awaited()
+        self.assertEqual(record["style_id"], "none")
+        self.assertIn("其余部分保持原图", record["final_prompt"])
+        self.plugin.client.image_to_image.assert_awaited_once_with("https://example.com/original.png", record["final_prompt"])
+
+    async def test_reference_image_is_normalized_and_never_uses_web_tools(self):
+        encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+        self.ctx.llm_generate.side_effect = [response({"prompt": "以图中人物为依据，海边坐姿", "summary": "参考原图", "image_mode": "reference"}), response(selection("reference"))]
+        accepted = await self.accept(Event(images=[Image(file="base64://" + encoded)]), image_mode="reference")
+        await self.finish()
+        self.ctx.tool_loop_agent.assert_not_awaited()
+        self.assertEqual(self.ctx.llm_generate.call_args_list[0].kwargs["image_urls"], ["data:image/png;base64," + encoded])
+        self.assertNotIn("image_urls", self.ctx.llm_generate.call_args_list[1].kwargs)
+        self.assertEqual(self.plugin.client.image_to_image.call_args.args[0], "base64://" + encoded)
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "completed")
+
+    async def test_invalid_plan_uses_seed_without_another_model(self):
+        self.ctx.tool_loop_agent.return_value = response({"prompt": "invalid"})
+        accepted = await self.accept(brief="画一只蓝色猫")
+        await self.finish()
+        self.ctx.llm_generate.assert_not_awaited()
+        self.assertIn("蓝色猫", self.plugin.client.text_to_image.call_args.args[0])
+        self.assertTrue(self.plugin.planner.plans[accepted["plan_id"]]["degraded"])
+
+    async def test_cancel_before_background_starts_and_shutdown_never_draw(self):
+        event = Event()
+        accepted = await self.accept(event)
+        await self.plugin.cancel_drawing(event, accepted["plan_id"])
+        await self.finish()
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "cancelled")
+        accepted = await self.accept(Event(mid="2"))
+        await self.plugin.terminate()
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "cancelled")
+        self.plugin.client.text_to_image.assert_not_awaited()
+        self.ctx.send_message.assert_not_awaited()
+
+    async def test_cancel_during_integration_and_reject_cancel_during_generation(self):
+        started = asyncio.Event()
 
         async def slow(*args, **kwargs):
             started.set()
-            await release.wait()
-            return "完整提示词：千束在街边微笑招手"
+            await asyncio.Event().wait()
 
+        event = Event()
         with patch.object(main, "integrate", slow):
-            accepted = json.loads(await asyncio.wait_for(self.plugin.draw_image(event, draft["plan_id"], caption="test caption~"), timeout=.1))
+            accepted = await self.accept(event)
             await started.wait()
-            self.assertEqual(accepted["phase"], "integrating")
-            self.ctx.send_message.assert_not_awaited()
-            self.plugin.client.text_to_image.assert_not_awaited()
-            self.assertNotIn(self.plugin._prompt_key(event), self.plugin._last_image_prompts)
-            duplicate = json.loads(await self.plugin.draw_image(event, draft["plan_id"], caption="test caption~"))
-            self.assertEqual(duplicate["status"], "integrating")
-            self.assertEqual(len(self.plugin._tasks), 1)
+            await self.plugin.cancel_drawing(event, accepted["plan_id"])
+            await self.finish()
+        self.plugin.client.text_to_image.assert_not_awaited()
+        self.ctx.send_message.assert_not_awaited()
+        release = asyncio.Event()
+        started.clear()
+
+        async def generate(*args):
+            started.set()
+            await release.wait()
+            return ["generated"]
+
+        self.plugin.client.text_to_image.side_effect = generate
+        accepted = await self.accept(Event(mid="2"))
+        await started.wait()
+        result = await self.plugin.cancel_drawing(event, accepted["plan_id"])
+        self.assertIn("只能取消", result)
+        release.set()
+        await self.finish()
+
+    async def test_duplicate_tool_calls_are_single_use_but_new_requests_are_independent(self):
+        event = Event()
+        first = await self.accept(event)
+        duplicate = await self.accept(event, caption="另一句")
+        self.assertEqual(first["plan_id"], duplicate["plan_id"])
+        second = await self.accept(event, brief="再画乙")
+        self.assertNotEqual(first["plan_id"], second["plan_id"])
+        await self.finish()
+        await self.plugin.draw_image(event, first["plan_id"], caption="重复")
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 2)
+        third = await self.accept(Event(mid="2"))
+        self.assertNotEqual(third["plan_id"], first["plan_id"])
+        await self.finish()
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 3)
+
+    async def test_other_user_cannot_read_cancel_revise_or_execute(self):
+        accepted = await self.accept()
+        bob = Event(user="bob")
+        self.assertIn("不属于", await self.plugin.get_drawing_plan(bob, accepted["plan_id"], full=True))
+        self.assertIn("不属于", await self.plugin.prepare_drawing(bob, "修改", base_plan_id=accepted["plan_id"]))
+        self.assertIn("只能取消", await self.plugin.cancel_drawing(bob, accepted["plan_id"]))
+        self.assertIn("有效方案编号", await self.plugin.draw_image(bob, accepted["plan_id"], caption="test"))
+        await self.finish()
+        self.plugin.client.text_to_image.assert_awaited_once()
+
+    async def test_revision_supersedes_background_task_and_preserves_snapshot(self):
+        event = Event()
+        first = await self.accept(event, brief="甲在海边")
+        second = await self.accept(event, brief="只把帽子改蓝", base_plan_id=first["plan_id"])
+        await self.finish()
+        self.assertEqual(self.plugin.planner.plans[first["plan_id"]]["status"], "superseded")
+        request = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])
+        self.assertIn("甲在海边", request["previous_prompt"])
+        self.assertEqual(request["brief"], "只把帽子改蓝")
+        self.assertEqual(self.plugin.planner.plans[second["plan_id"]]["status"], "completed")
+        self.plugin.client.text_to_image.assert_awaited_once()
+
+    async def test_revision_keeps_original_image_even_before_resolution_finishes(self):
+        original = Event(images=[Image(url="https://example.com/original.png")])
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def resolve(_context, event, _client):
+            if event is original:
+                started.set()
+                await release.wait()
+                return "https://example.com/original.png"
+            return None
+
+        with patch.object(main, "resolve_input_image", resolve):
+            first = await self.accept(original, brief="只把帽子改蓝", image_mode="edit")
+            await started.wait()
+            second = await self.accept(Event(mid="2"), brief="帽子改为红色", base_plan_id=first["plan_id"])
             release.set()
             await self.finish()
-        deliveries = self.ctx.send_message.call_args_list
-        self.assertEqual(len(deliveries), 2)
-        self.assertEqual(deliveries[0].args[1].text, record["caption"])
-        self.assertEqual(deliveries[1].args[1].image, "generated")
-        self.plugin.client.text_to_image.assert_awaited_once_with(record["final_prompt"])
+        self.assertEqual(self.plugin.planner.plans[first["plan_id"]]["status"], "superseded")
+        self.assertEqual(self.plugin.planner.plans[second["plan_id"]]["status"], "completed")
+        self.assertEqual(self.plugin.client.image_to_image.call_args.args[0], "https://example.com/original.png")
+        self.plugin.client.image_to_image.assert_awaited_once()
+        self.assertFalse(self.plugin._image_sources)
 
-    async def test_drawing_chatter_is_suppressed_only_for_its_event(self):
+    async def test_active_snapshot_cannot_expire_or_be_evicted(self):
+        accepted = await self.accept()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        record["created"] -= planning.PLAN_TTL + 1
+        self.assertIs(self.plugin.planner.get(record["owner"], record["plan_id"]), record)
+        with patch.object(planning, "PLAN_LIMIT", 1):
+            result = await self.plugin.prepare_drawing(Event(mid="2"), "另一个任务")
+        self.assertIn("繁忙", result)
+        await self.finish()
+
+    async def test_followup_uses_full_prompt_and_keeps_selected_style(self):
+        self.ctx.tool_loop_agent.return_value = response({"prompt": "喜多挥手", "summary": "喜多", "image_mode": "none", "style_id": "window_overlay_poetic"})
+        self.ctx.llm_generate.return_value = response(selection(style="window_overlay_poetic"))
+        await self.accept()
+        await self.finish()
+        original = self.plugin.client.text_to_image.call_args.args[0]
+        self.assertIn(integrator.STYLE_PARTS["window_overlay_poetic"][0], original)
+        self.ctx.tool_loop_agent.side_effect = asyncio.TimeoutError()
+        second = await self.accept(Event(mid="2"), brief="只改成坐姿", use_last=True)
+        await self.finish()
+        task = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])
+        self.assertEqual(task["previous_prompt"], original)
+        record = self.plugin.planner.plans[second["plan_id"]]
+        self.assertTrue(record["final_prompt"].startswith(original))
+        self.assertEqual(record["final_prompt"].count(integrator.STYLE_HEADER), 1)
+        self.assertEqual(record["style_id"], "window_overlay_poetic")
+
+    async def test_search_tool_scope_is_frozen_at_acceptance(self):
+        disabled = FunctionTool("web_search_bocha", "search", {})
+        disabled.active = False
+        req = types.SimpleNamespace(system_prompt="人设", func_tool=ToolSet([self.web, FunctionTool("shell", "command", {}), disabled]))
         event = Event()
-        await self.prepare(event)
+        await self.plugin.on_llm_request(event, req)
+        await self.plugin.on_llm_request(event, req)
+        self.assertEqual(req.system_prompt.count(main._DRAWING_RULES), 1)
+        await self.accept(event)
+        self.plugin._search_tools[self.plugin._prompt_key(event)] = ()
+        await self.finish()
+        names = [tool.name for tool in self.ctx.tool_loop_agent.call_args.kwargs["tools"].tools]
+        self.assertEqual(names, ["web_search_tavily", "compare_subject_reference", "save_subject_assessment"])
+
+    async def test_failed_integration_preserves_plan_and_delivers(self):
+        with patch.object(main, "integrate", AsyncMock(return_value=None)):
+            accepted = await self.accept()
+            await self.finish()
+        record = self.plugin.planner.plans[accepted["plan_id"]]
+        self.assertTrue(record["final_prompt"].startswith(record["prompt"]))
+        self.assertTrue(record["style_selection"]["fallback"])
+        self.assertEqual(record["status"], "completed")
+
+    async def test_delivery_failure_is_not_completed(self):
+        for failure in (False, RuntimeError("platform unavailable")):
+            self.ctx.send_message.side_effect = [True, failure]
+            accepted = await self.accept(Event())
+            await self.finish()
+            self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "delivery_failed")
+
+    async def test_safety_retry_updates_actual_prompt(self):
+        self.plugin.client.text_to_image.side_effect = [main.QiniuSafetyError(400, "safety"), ["generated"]]
+        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="安全的完整替代提示词")):
+            accepted = await self.accept()
+            await self.finish()
+        self.assertIn("安全的完整替代提示词", await self.plugin.get_drawing_plan(Event(), accepted["plan_id"], full=True))
+        self.assertIn("notice", json.loads(await self.plugin.get_last_image_prompt(Event())))
+
+    async def test_chatter_suppression_is_only_for_its_event(self):
+        event = Event()
+        await self.accept(event)
         event.result = types.SimpleNamespace(chain=["QINIU_DRAWING_DONE"], is_llm_result=lambda: True)
         await self.plugin.suppress_drawing_chatter(event)
         self.assertEqual(event.result.chain, [])
-        # The second bot and ordinary messages are independent, even for the same group/user.
         other = Event()
         other.result = types.SimpleNamespace(chain=["正常聊天"], is_llm_result=lambda: True)
         await self.plugin.suppress_drawing_chatter(other)
         self.assertEqual(other.result.chain, ["正常聊天"])
-        event.result = types.SimpleNamespace(chain=["插件图片"], is_llm_result=lambda: False)
-        await self.plugin.suppress_drawing_chatter(event)
-        self.assertEqual(event.result.chain, ["插件图片"])
-
-    async def test_safety_retry_updates_plan_and_last_full_prompt(self):
-        self.plugin.client.text_to_image.side_effect = [main.QiniuSafetyError(400, "safety"), ["generated"]]
-        draft = await self.prepare()
-        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="安全的完整替代提示词")):
-            await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
-            await self.finish()
-        self.assertIn("安全的完整替代提示词", await self.plugin.get_last_image_prompt(Event(), full=True))
-        self.assertIn("安全的完整替代提示词", await self.plugin.get_drawing_plan(Event(), draft["plan_id"], full=True))
-        self.assertIn("notice", json.loads(await self.plugin.get_last_image_prompt(Event())))
-
-    async def test_planning_and_wrapup_timeout_cancel_work_and_submit_image_once(self):
-        cancellations = []
-
-        async def slow(**kwargs):
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cancellations.append(True)
-
-        self.ctx.tool_loop_agent.side_effect = slow
-        self.ctx.llm_generate.side_effect = slow
-        event = Event()
-        with patch.object(main, "PLANNING_TOOL_TIMEOUT_SECONDS", .01), patch.object(planning, "FALLBACK_TIMEOUT_SECONDS", .01):
-            result = json.loads(await asyncio.wait_for(self.plugin.prepare_drawing(event, "画猫"), timeout=.5))
-            await asyncio.wait_for(self.finish(), timeout=.5)
-        self.assertEqual(result["status"], "accepted")
-        self.assertEqual(len(cancellations), 2)
-        self.assertTrue(event.get_extra(main._SILENT_DRAWING))
-        self.assertFalse(self.plugin._preparing)
-        record = self.plugin.planner.plans[result["plan_id"]]
-        self.assertTrue(record["degraded"])
-        self.assertIn("画猫", record["final_prompt"])
-        self.assertEqual(record["status"], "completed")
-        repeated = json.loads(await self.plugin.prepare_drawing(event, "画猫"))
-        self.assertEqual(repeated["plan_id"], record["plan_id"])
-        self.ctx.tool_loop_agent.assert_awaited_once()
-        await self.plugin.draw_image(event, result["plan_id"], caption="duplicate")
-        self.plugin.client.text_to_image.assert_awaited_once()
-        self.assertEqual(self.ctx.send_message.call_args.args[1].image, "generated")
-
-    async def test_external_cancellation_never_starts_fallback_or_generation(self):
-        started = asyncio.Event()
-
-        async def slow(**kwargs):
-            started.set()
-            await asyncio.Event().wait()
-
-        self.ctx.tool_loop_agent.side_effect = slow
-        task = asyncio.create_task(self.plugin.prepare_drawing(Event(), "画猫"))
-        await started.wait()
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        self.ctx.llm_generate.assert_not_awaited()
-        self.assertFalse(self.plugin._preparing)
-        self.plugin.client.text_to_image.assert_not_awaited()
-
-    async def test_invalid_planning_result_stops_retrying_and_draws(self):
-        self.ctx.tool_loop_agent.return_value = response({"prompt": "无效方案"})
-        result = json.loads(await self.plugin.prepare_drawing(Event(), "画一只蓝色猫"))
         await self.finish()
-        self.assertEqual(result["status"], "accepted")
-        self.ctx.tool_loop_agent.assert_awaited_once()
-        self.assertIn("蓝色猫", self.plugin.client.text_to_image.call_args.args[0])
 
-    async def test_wrapup_uses_available_results_without_reopening_tools_or_integration(self):
-        self.ctx.tool_loop_agent.side_effect = asyncio.TimeoutError()
-        self.ctx.llm_generate.return_value = response({"prompt": "一只蓝色猫在窗边晒太阳", "summary": "蓝色猫，窗边"})
-        with patch.object(main, "integrate", AsyncMock()) as integrate:
-            result = json.loads(await self.plugin.prepare_drawing(Event(), "画一只蓝色猫"))
-            await self.finish()
-        record = self.plugin.planner.plans[result["plan_id"]]
-        self.assertEqual(record["prompt"], "一只蓝色猫在窗边晒太阳")
-        self.assertTrue(record["final_prompt"].startswith(record["prompt"]))
-        self.assertEqual(record["status"], "completed")
-        self.ctx.llm_generate.assert_awaited_once()
-        self.assertNotIn("tools", self.ctx.llm_generate.call_args.kwargs)
-        integrate.assert_not_awaited()
-
-    async def test_failed_vision_planning_keeps_input_image_and_explicit_edit_scope(self):
-        self.ctx.llm_generate.side_effect = RuntimeError("vision unavailable")
-        event = Event(images=[Image(url="https://example.com/original.png")])
-        result = json.loads(await self.plugin.prepare_drawing(event, "只把帽子改蓝", image_mode="edit"))
+    async def test_bad_input_and_missing_image_never_generate(self):
+        for kwargs in ({"research_mode": "bad"}, {"caption": "长" * 61}, {"image_mode": "bad"}):
+            self.assertNotIn("accepted", await self.plugin.prepare_drawing(Event(), "画猫", **kwargs))
+        accepted = await self.accept(image_mode="edit")
         await self.finish()
-        record = self.plugin.planner.plans[result["plan_id"]]
-        self.assertEqual(record["image_ref"], "https://example.com/original.png")
-        self.assertEqual(record["image_mode"], "edit")
-        self.assertEqual(record["style_id"], "none")
-        self.assertIn("其余部分保持原图", record["final_prompt"])
-        self.assertEqual(record["status"], "completed")
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "failed")
         self.plugin.client.text_to_image.assert_not_awaited()
-        self.plugin.client.image_to_image.assert_awaited_once_with(record["image_ref"], record["final_prompt"])
-        self.ctx.tool_loop_agent.assert_not_awaited()
+        self.ctx.send_message.assert_awaited_once()
 
-    async def test_base64_image_is_normalized_for_planning_and_kept_for_generation(self):
-        encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
-        self.ctx.llm_generate.return_value = response({"prompt": "参考图中主体", "summary": "参考原图", "image_mode": "reference"})
-        event = Event(images=[Image(file="base64://" + encoded)])
-        draft = await self.prepare(event)
-        self.assertEqual(self.ctx.llm_generate.call_args.kwargs["image_urls"], ["data:image/png;base64," + encoded])
-        self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["image_ref"], "base64://" + encoded)
+    async def test_unreadable_input_image_cannot_fall_back_to_text_generation(self):
+        with patch.object(main, "resolve_input_image", AsyncMock(return_value=None)):
+            accepted = await self.accept(Event(images=[Image(file="invalid-image")]))
+            await self.finish()
+        self.assertEqual(self.plugin.planner.plans[accepted["plan_id"]]["status"], "failed")
+        self.plugin.client.text_to_image.assert_not_awaited()
+        self.plugin.client.image_to_image.assert_not_awaited()
 
     async def test_keyword_trigger_keeps_baseline_path(self):
         event = Event(text="画图 一只猫")
@@ -787,12 +873,12 @@ class PlanningResearchTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(planner.prepare(Event(), "owner", "画甲和乙", search_tools=[source], fallback_state=state), timeout=.05)
         self.assertTrue(cancelled.is_set())
         ctx.llm_generate.side_effect = RuntimeError("wrapup unavailable")
-        record = await planner.prepare_fallback(Event(), "owner", "画甲和乙", state=state, reason="超时")
+        record = planner.snapshot("owner", "画甲和乙", state=state)
         self.assertEqual(len(record["research"]), 1)
         self.assertEqual(record["checks"][0]["status"], "confirmed")
         self.assertIn("银发红瞳", record["prompt"])
         self.assertEqual(record["subject_assessments"], [{"subject": "甲", "relation": "confirmed"}, {"subject": "乙", "relation": "unverified"}])
-        self.assertIn("超时", planner.describe(record)["limitation"])
+        self.assertEqual(planner.describe(record)["search_count"], 1)
         ctx.tool_loop_agent.assert_awaited_once()
 
     async def test_fallback_preserves_base_and_respects_style_modes(self):
@@ -800,17 +886,17 @@ class PlanningResearchTests(unittest.IsolatedAsyncioTestCase):
         ctx.llm_generate.side_effect = RuntimeError("offline")
         planner = planning.DrawingPlanner(ctx)
         base = "甲坐在海边\n" + integrator.STYLE_HEADER + "\n原画风\n" + integrator.QUALITY_HEADER + "\n原质量"
-        record = await planner.prepare_fallback(Event(), "owner", "只把帽子改蓝", state={}, reason="超时",
+        record = planner.snapshot("owner", "只把帽子改蓝", state={},
                                                 previous_prompt=base, previous_style_id="window_overlay_poetic")
         self.assertTrue(record["prompt"].startswith(base))
         self.assertEqual(record["style_id"], "window_overlay_poetic")
-        changed = await planner.prepare_fallback(Event(), "owner", "只把帽子改蓝", state={}, reason="超时",
+        changed = planner.snapshot("owner", "只把帽子改蓝", state={},
                                                 previous_prompt=base, style_request="水彩")
         self.assertNotIn("原画风", changed["prompt"])
         self.assertIn("甲坐在海边", changed["prompt"])
         self.assertIn("水彩", changed["prompt"])
         for style_mode in ("disabled", "explicit_only"):
-            result = await planner.prepare_fallback(Event(), "owner", "画猫", state={}, reason="超时", style_mode=style_mode)
+            result = planner.snapshot("owner", "画猫", state={}, style_mode=style_mode)
             self.assertEqual(result["style_id"], "none")
 
     async def test_logged_paraphrase_of_confirmed_features_no_longer_restarts_planning(self):
