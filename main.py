@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import re
 import time
 import traceback
 from typing import Dict, List, Optional, Set, Tuple
@@ -36,13 +35,19 @@ _SILENT_DRAWING = "qiniu_image_silent_drawing"
 PLANNING_TOOL_TIMEOUT_SECONDS = 55
 
 _DRAWING_RULES = """
-绘图时先调用 prepare_drawing：交代用户意图、必要人设/指代、硬性要求及允许自由设计的部分。
+绘图时先调用 prepare_drawing：交代用户原话、意图、必要人设/指代、硬性要求及允许自由设计的部分。
+区分用户明确要求与你凭记忆补充的角色知识；后者标为待核实认识，不能写成用户指定的核心人设。
 独立规划模型负责搜索、特征核对和动作构图。检查返回的摘要，不满意则带 base_plan_id 提修改意见；
-确认符合委托后调用 draw_image(plan_id)，不要并行准备与出图，也不用额外询问用户批准。
+确认符合委托后调用 draw_image(plan_id, caption)，不要并行准备与出图，也不用额外询问用户批准。
+caption 由你用当前主 Bot 人格写一句自然的短回复，简单说画谁即可，不写工整的场景解说，不复述摘要。
+例如猫娘人格可说“这次画元气千束喵～”，其他人格用自己的口吻，不统一加喵；不要声称图片已完成。
+新收到“再画乙/画乙”是新增请求，不会自动取消之前的甲；逐份检查并提交，不能漏掉已准备方案。
+pending_review 表示还有未提交的方案，先检查并 draw_image；只有用户明确取消/替换才 cancel_drawing 或修改旧稿。
 修改上一张作品可用 use_last=true，让规划模型直接读取完整缓存；必要时用 get_drawing_plan(full=true)
-或 get_last_image_prompt(full=true) 查看全文和依据。默认只返回摘要，accepted 后等自动发图，不重复调用。
+或 get_last_image_prompt(full=true) 查看全文和依据。默认只返回摘要，accepted 仅受理这一份，仍要处理其他绘图请求。
 整个绘图工具链静默执行：调用工具前后都不要发“稍等、正在规划、方案已确认、重试、后台加速”等过程消息，
-不要复述内部摘要或错误堆栈。完整提示词准备好后插件会统一发一句画面说明并发送图片，你无需再补回复。
+不要复述内部摘要或错误堆栈。完整提示词准备好后插件代发 caption 并发送图片，不另发可见回复。
+所有请求均已处理后，最终回复必须仅输出内部标记 QINIU_DRAWING_DONE，插件会隐藏它；不要返回空内容。
 失败时只简短说明失败原因，不要承诺已经在出图或“马上就来”。
 """.strip()
 
@@ -50,7 +55,7 @@ _DRAWING_RULES = """
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "2.2.1",
+    "2.2.2",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -161,6 +166,11 @@ class QiniuImagePlugin(Star):
     def _prompt_key(self, event):
         return json.dumps([str(event.unified_msg_origin), str(event.get_sender_id())])
 
+    def _pending_review(self, owner, exclude=""):
+        self.planner.prune()
+        return [self.planner.describe(record) for record in self.planner.plans.values()
+                if record["owner"] == owner and record["status"] == "ready" and record["plan_id"] != exclude]
+
     @filter.on_decorating_result()
     async def suppress_drawing_chatter(self, event):
         """Only suppress this drawing turn's LLM chatter; plugin deliveries bypass this hook."""
@@ -187,6 +197,11 @@ class QiniuImagePlugin(Star):
         if image_mode not in ("auto", "edit", "reference") or (base_plan_id and use_last):
             return "图片用途应为 auto/edit/reference；base_plan_id 与 use_last 不能同时使用。"
         owner = self._prompt_key(event)
+        pending = self._pending_review(owner, exclude=base_plan_id)
+        if pending:
+            event.set_extra(_SILENT_DRAWING, True)
+            return json.dumps({"status": "pending_review", "plans": pending,
+                               "instruction": "前面的绘图请求尚未提交。先检查这些摘要并逐份 draw_image(plan_id, caption)，再准备本次新增请求；只有用户明确取消时才 cancel_drawing。"}, ensure_ascii=False)
         if owner in self._preparing:
             event.set_extra(_SILENT_DRAWING, True)
             return '{"status":"pending","instruction":"已有方案正在准备，请等待。"}'
@@ -220,8 +235,9 @@ class QiniuImagePlugin(Star):
             ), timeout=PLANNING_TOOL_TIMEOUT_SECONDS)
             if base and base["status"] == "ready":
                 base["status"] = "superseded"
+            logger.info(f"qiniu-image plan ready | umo={event.unified_msg_origin} plan_id={record['plan_id']} search_count={len(record['research'])}")
             result = self.planner.describe(record)
-            result["instruction"] = "静默检查摘要，不要向用户复述或播报进度；需要修改则重新准备，符合委托后直接调用 draw_image(plan_id)。"
+            result["instruction"] = "静默检查摘要；需修改则重新准备，符合委托后调用 draw_image(plan_id, caption)，caption 用你当前人格自然地说画谁。收到新增请求也要先处理这份方案。"
             return json.dumps(result, ensure_ascii=False)
         except asyncio.CancelledError:
             raise
@@ -245,12 +261,28 @@ class QiniuImagePlugin(Star):
             return "方案不存在、已过期或不属于当前用户。"
         return json.dumps(self.planner.describe(record, full), ensure_ascii=False)
 
+    @filter.llm_tool(name="cancel_drawing")
+    async def cancel_drawing(self, event: AstrMessageEvent, plan_id: str):
+        """仅在用户明确取消或替换请求时，取消尚未提交的方案；新增绘图不表示取消。
+
+        Args:
+            plan_id(string): 用户明确不再需要的待审方案编号。
+        """
+        record = self.planner.get(self._prompt_key(event), plan_id)
+        if not record or record["status"] != "ready":
+            return "只能取消当前用户尚未提交的待审方案。"
+        record["status"] = "cancelled"
+        event.set_extra(_SILENT_DRAWING, True)
+        return json.dumps({"status": "cancelled", "plan_id": plan_id,
+                           "instruction": "继续处理其他请求；全部处理后仅输出 QINIU_DRAWING_DONE。"}, ensure_ascii=False)
+
     @filter.llm_tool(name="draw_image")
-    async def draw_image(self, event: AstrMessageEvent, plan_id: str):
+    async def draw_image(self, event: AstrMessageEvent, plan_id: str, caption: str = ""):
         """静默确认并提交方案，立即返回；后台整合提示词和出图。不要另发确认、等待或重试消息。
 
         Args:
             plan_id(string): 已检查并符合用户委托的 prepare_drawing 方案编号。
+            caption(string): 用你当前聊天人格写的简短口语，60字以内，说画谁即可；由插件在完整提示词就绪时代发，不要另行回复。
         """
         if not self.client.configured:
             event.set_extra(_SILENT_DRAWING, False)
@@ -262,28 +294,37 @@ class QiniuImagePlugin(Star):
         event.set_extra(_SILENT_DRAWING, True)
         if record["status"] != "ready":
             return json.dumps({"status": record["status"], "plan_id": plan_id,
-                               "instruction": "不要重复出图；如需修改或重画，请准备新方案。"}, ensure_ascii=False)
+                               "instruction": "不要重复出图；继续处理其他请求，全部处理后仅输出 QINIU_DRAWING_DONE。"}, ensure_ascii=False)
+        if not isinstance(caption, str) or not caption.strip() or len(caption.strip()) > 60:
+            return json.dumps({"status": "ready", "plan_id": plan_id,
+                               "instruction": "请补上 caption 后再调用：按你当前人格自然地说一句画谁，60字以内，不复述方案，不声称已经画好。"}, ensure_ascii=False)
+        record["caption"] = caption.strip()
         record["status"] = "integrating"
+        logger.info(f"qiniu-image accepted | umo={event.unified_msg_origin} plan_id={plan_id}")
         task = asyncio.create_task(self._integrate_and_push(event, record))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return json.dumps({"status": "accepted", "plan_id": plan_id, "phase": "integrating",
-                           "instruction": "静默等待，勿再回复用户或重复调用。插件会在完整提示词准备好后只发一句画面说明，再自动发图。"}, ensure_ascii=False)
+                           "instruction": "本方案已受理，不重复调用。继续处理尚未完成的其他绘图请求；全部处理后仅输出 QINIU_DRAWING_DONE 作为内部收尾，不能返回空内容。插件会代发 caption 和图片。"}, ensure_ascii=False)
 
     async def _integrate_and_push(self, event, record):
         """Keep provider fallbacks outside AstrBot's tool timeout, with exactly one caption."""
         try:
+            selection = {}
             final_prompt = await integrate(
                 self.context, event.unified_msg_origin, record["prompt"], has_image=bool(record["image_ref"]),
                 image_mode=record["image_mode"] if record["image_ref"] else "auto",
                 style_mode=self.style_mode, style_strength=self.style_strength,
                 provider_id=self.rewrite_provider_id, fallback_provider_ids=self.rewrite_fallback_provider_ids,
+                selection_out=selection,
             )
             if not final_prompt:
                 record["status"] = "failed"
                 await self._push_text(event, "生成失败喵（提示词整合暂时不可用）")
                 return
             record["final_prompt"] = final_prompt
+            record["style_selection"] = selection
+            logger.info(f"qiniu-image prompt ready | umo={event.unified_msg_origin} plan_id={record['plan_id']} selection={json.dumps(selection, ensure_ascii=False)}")
             record["status"] = "generating"
             self._remember_image_prompt(event, final_prompt, has_image=bool(record["image_ref"]), plan=record)
             await self._push_text(event, self._drawing_caption(record))
@@ -298,11 +339,7 @@ class QiniuImagePlugin(Star):
 
     @staticmethod
     def _drawing_caption(record):
-        caption = record.get("caption")
-        if not isinstance(caption, str) or not caption.strip() or len(caption.strip()) > 60:
-            caption = re.split(r"[。！？\n]", record["summary"], maxsplit=1)[0]
-        caption = " ".join(caption.split()).strip("。！？ ")
-        return caption[:59].rstrip("，、； ") + "。"
+        return record["caption"]
 
     async def _push_text(self, event, text):
         try:
@@ -334,6 +371,7 @@ class QiniuImagePlugin(Star):
                   "instruction": "修改时调用 prepare_drawing(use_last=true)，无需复述完整提示词；此记录不代表已出图成功。"}
         if full:
             result["prompt"] = record["prompt"]
+            result["style_selection"] = record.get("style_selection", {})
         if record.get("adjusted_after_review"):
             result["notice"] = "已使用审核后的安全替代提示词，原摘要仅供参考，可按需读取实际全文。"
         return json.dumps(result, ensure_ascii=False)
@@ -360,17 +398,22 @@ class QiniuImagePlugin(Star):
             )
             image_b64, error_text = None, "生成失败喵"
 
-        if plan is not None:
-            plan["status"] = "completed" if image_b64 else "failed"
         chain = (
             MessageChain().base64_image(image_b64)
             if image_b64
             else MessageChain().message(error_text or "生成失败喵")
         )
         try:
-            await self.context.send_message(event.unified_msg_origin, chain)
+            delivered = await self.context.send_message(event.unified_msg_origin, chain)
+            if delivered is False:
+                raise RuntimeError("消息平台未接受发送")
+            if plan is not None:
+                plan["status"] = "completed" if image_b64 else "failed"
+                logger.info(f"qiniu-image delivered | umo={event.unified_msg_origin} plan_id={plan['plan_id']} status={plan['status']}")
         except Exception as exc:
-            logger.error(f"qiniu-image: 推送结果失败（{type(exc).__name__}: {exc}）")
+            if plan is not None:
+                plan["status"] = "delivery_failed"
+            logger.error(f"qiniu-image: 推送结果失败 | umo={event.unified_msg_origin} plan_id={plan['plan_id'] if plan else ''}（{type(exc).__name__}: {exc}）")
 
     async def _draw(
         self,
@@ -474,6 +517,7 @@ class QiniuImagePlugin(Star):
             "plan_id": plan["plan_id"] if plan else "",
             "summary": plan["summary"] if plan else "关键词直出；完整提示词已保存",
             "adjusted_after_review": bool(plan and plan.get("adjusted_after_review")),
+            "style_selection": plan.get("style_selection", {}) if plan else {},
         }
         if len(self._last_image_prompts) > 100:
             oldest = min(
@@ -492,6 +536,11 @@ class QiniuImagePlugin(Star):
         """返回图片或错误提示。"""
         try:
             self._remember_image_prompt(event, prompt, has_image=bool(image_ref), plan=plan)
+            if plan is not None:
+                logger.info("qiniu-image generation request | " + json.dumps({
+                    "umo": str(event.unified_msg_origin), "plan_id": plan["plan_id"],
+                    "adjusted_after_review": bool(plan.get("adjusted_after_review")),
+                    "prompt": prompt}, ensure_ascii=False))
             if image_ref:
                 images: List[str] = await self.client.image_to_image(image_ref, prompt)
             else:

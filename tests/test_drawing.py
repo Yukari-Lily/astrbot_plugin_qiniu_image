@@ -158,6 +158,14 @@ class Event:
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_selection_audit_matches_exact_assembled_fragments(self):
+        audit = {}
+        text = await integrator.integrate(context(), "g", "千束招手", has_image=False, selection_out=audit)
+        self.assertEqual(audit, selection())
+        self.assertEqual(text, "千束招手\n\n" + integrator.STYLE_HEADER + "\n" +
+                         integrator.STYLE_PARTS[audit["style_id"]][1] + "\n\n" +
+                         integrator.QUALITY_HEADER + "\n" + integrator.QUALITY_PARTS[0])
+
     async def test_gemini_fenced_json_is_accepted_on_first_attempt(self):
         for fence in ("json", "JSON", ""):
             ctx = context()
@@ -346,9 +354,9 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("draw_image", [t.name for t in self.ctx.tool_loop_agent.call_args.kwargs["tools"].tools])
         self.plugin.client.text_to_image.assert_not_awaited()
         self.ctx.llm_generate.assert_not_awaited()
-        rejected = await self.plugin.draw_image(event, "直接画一个主体")
+        rejected = await self.plugin.draw_image(event, "直接画一个主体", caption="test caption~")
         self.assertIn("prepare_drawing", rejected)
-        accepted = json.loads(await self.plugin.draw_image(event, draft["plan_id"]))
+        accepted = json.loads(await self.plugin.draw_image(event, draft["plan_id"], caption="test caption~"))
         self.assertEqual(accepted["status"], "accepted")
         self.assertNotIn("prompt", accepted)
         await self.finish()
@@ -357,6 +365,59 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.client.text_to_image.assert_awaited_once_with(full["prompt"])
         self.assertNotIn("prompt", json.loads(await self.plugin.get_last_image_prompt(event)))
 
+    async def test_followup_cannot_skip_unsubmitted_plan_and_bots_are_independent(self):
+        event = Event()
+        first = await self.prepare(event)
+        second = json.loads(await self.plugin.prepare_drawing(event, "再画喜多"))
+        self.assertEqual(second["status"], "pending_review")
+        self.assertEqual(second["plans"][0]["plan_id"], first["plan_id"])
+        self.ctx.tool_loop_agent.assert_awaited_once()
+        self.plugin.client.text_to_image.assert_not_awaited()
+        other_bot = Event()
+        other_bot.unified_msg_origin = "second-bot:group"
+        other = await self.prepare(other_bot)
+        self.assertEqual(other["status"], "ready")
+        await self.plugin.draw_image(event, first["plan_id"], caption="千束喵～")
+        second = json.loads(await self.plugin.prepare_drawing(event, "再画喜多"))
+        self.assertEqual(second["status"], "ready")
+        await self.plugin.draw_image(event, second["plan_id"], caption="再画个喜多喵")
+        await self.finish()
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 2)
+
+    async def test_cancellation_releases_pending_plan_without_drawing(self):
+        event = Event()
+        draft = await self.prepare(event)
+        self.assertIn("只能取消", await self.plugin.cancel_drawing(Event(user="bob"), draft["plan_id"]))
+        result = json.loads(await self.plugin.cancel_drawing(event, draft["plan_id"]))
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual((await self.prepare(event))["status"], "ready")
+        self.plugin.client.text_to_image.assert_not_awaited()
+
+    async def test_caption_comes_from_main_persona_and_is_sent_only_after_prompt_ready(self):
+        event = Event()
+        draft = await self.prepare(event)
+        rejected = json.loads(await self.plugin.draw_image(event, draft["plan_id"]))
+        self.assertEqual(rejected["status"], "ready")
+        self.assertFalse(self.plugin._tasks)
+        caption = "千束喵～元气满满的那种！"
+        accepted = json.loads(await self.plugin.draw_image(event, draft["plan_id"], caption=caption))
+        self.assertIn("QINIU_DRAWING_DONE", accepted["instruction"])
+        await self.finish()
+        self.assertEqual(self.ctx.send_message.call_args_list[0].args[1].text, caption)
+        self.ctx.llm_generate.assert_awaited_once()  # Only integration; no extra caption model.
+        full = json.loads(await self.plugin.get_drawing_plan(event, draft["plan_id"], full=True))
+        self.assertEqual(full["style_selection"]["style_id"], "clean_anime_wallpaper")
+        self.assertEqual(full["prompt"], self.plugin.client.text_to_image.call_args.args[0])
+
+    async def test_delivery_failure_is_not_marked_completed(self):
+        for failure in (False, RuntimeError("platform unavailable")):
+            event = Event()
+            draft = await self.prepare(event)
+            self.ctx.send_message.side_effect = [True, failure]
+            await self.plugin.draw_image(event, draft["plan_id"], caption="千束喵～")
+            await self.finish()
+            self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["status"], "delivery_failed")
+
     async def test_revision_changes_id_and_supersedes_unapproved_draft(self):
         event = Event()
         first = await self.prepare(event)
@@ -364,7 +425,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(first["plan_id"], second["plan_id"])
         previous = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])["previous_prompt"]
         self.assertIn("银发红瞳", previous)
-        blocked = json.loads(await self.plugin.draw_image(event, first["plan_id"]))
+        blocked = json.loads(await self.plugin.draw_image(event, first["plan_id"], caption="test caption~"))
         self.assertEqual(blocked["status"], "superseded")
         self.plugin.client.text_to_image.assert_not_awaited()
 
@@ -373,14 +434,14 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         bob = Event(user="bob")
         self.assertIn("不属于", await self.plugin.get_drawing_plan(bob, draft["plan_id"], full=True))
         self.assertIn("不属于", await self.plugin.prepare_drawing(bob, "修改", base_plan_id=draft["plan_id"]))
-        self.assertIn("有效方案编号", await self.plugin.draw_image(bob, draft["plan_id"]))
+        self.assertIn("有效方案编号", await self.plugin.draw_image(bob, draft["plan_id"], caption="test caption~"))
         self.plugin.client.text_to_image.assert_not_awaited()
 
     async def test_plan_is_single_use_even_after_completion(self):
         draft = await self.prepare()
-        await self.plugin.draw_image(Event(), draft["plan_id"])
+        await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
         await self.finish()
-        again = json.loads(await self.plugin.draw_image(Event(), draft["plan_id"]))
+        again = json.loads(await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~"))
         self.assertEqual(again["status"], "completed")
         self.plugin.client.text_to_image.assert_awaited_once()
 
@@ -388,11 +449,11 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         draft = await self.prepare()
         record = self.plugin.planner.plans[draft["plan_id"]]
         record["created"] -= planning.PLAN_TTL + 1
-        self.assertIn("有效方案编号", await self.plugin.draw_image(Event(), draft["plan_id"]))
+        self.assertIn("有效方案编号", await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~"))
 
     async def test_followup_loads_complete_prompt_inside_planner(self):
         draft = await self.prepare()
-        await self.plugin.draw_image(Event(), draft["plan_id"])
+        await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
         await self.finish()
         full = json.loads(await self.plugin.get_last_image_prompt(Event(), full=True))["prompt"]
         await self.plugin.prepare_drawing(Event(mid="2"), "只把坐姿改为站姿", use_last=True)
@@ -411,7 +472,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vision["image_urls"], ["https://example.com/user.png"])
         self.assertNotIn("tools", vision)
         # Executing from a later turn uses the reviewed image, not a different new attachment.
-        await self.plugin.draw_image(Event(images=[Image(url="https://example.com/different.png")]), draft["plan_id"])
+        await self.plugin.draw_image(Event(images=[Image(url="https://example.com/different.png")]), draft["plan_id"], caption="test caption~")
         await self.finish()
         self.assertEqual(self.plugin.client.image_to_image.call_args.args[0], "https://example.com/user.png")
         self.assertNotIn("image_urls", self.ctx.llm_generate.call_args.kwargs)
@@ -433,7 +494,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_integration_sends_one_failure_without_claiming_generation(self):
         draft = await self.prepare()
         with patch.object(main, "integrate", AsyncMock(return_value=None)):
-            await self.plugin.draw_image(Event(), draft["plan_id"])
+            await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
             await self.finish()
         self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["status"], "failed")
         self.plugin.client.text_to_image.assert_not_awaited()
@@ -445,7 +506,6 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         event = Event()
         draft = await self.prepare(event)
         record = self.plugin.planner.plans[draft["plan_id"]]
-        record["caption"] = "千束在阳光下的街边微笑招手。"
         started, release = asyncio.Event(), asyncio.Event()
 
         async def slow(*args, **kwargs):
@@ -454,13 +514,13 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             return "完整提示词：千束在街边微笑招手"
 
         with patch.object(main, "integrate", slow):
-            accepted = json.loads(await asyncio.wait_for(self.plugin.draw_image(event, draft["plan_id"]), timeout=.1))
+            accepted = json.loads(await asyncio.wait_for(self.plugin.draw_image(event, draft["plan_id"], caption="test caption~"), timeout=.1))
             await started.wait()
             self.assertEqual(accepted["phase"], "integrating")
             self.ctx.send_message.assert_not_awaited()
             self.plugin.client.text_to_image.assert_not_awaited()
             self.assertNotIn(self.plugin._prompt_key(event), self.plugin._last_image_prompts)
-            duplicate = json.loads(await self.plugin.draw_image(event, draft["plan_id"]))
+            duplicate = json.loads(await self.plugin.draw_image(event, draft["plan_id"], caption="test caption~"))
             self.assertEqual(duplicate["status"], "integrating")
             self.assertEqual(len(self.plugin._tasks), 1)
             release.set()
@@ -474,7 +534,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
     async def test_drawing_chatter_is_suppressed_only_for_its_event(self):
         event = Event()
         await self.prepare(event)
-        event.result = types.SimpleNamespace(chain=["方案核对完成，马上出图"], is_llm_result=lambda: True)
+        event.result = types.SimpleNamespace(chain=["QINIU_DRAWING_DONE"], is_llm_result=lambda: True)
         await self.plugin.suppress_drawing_chatter(event)
         self.assertEqual(event.result.chain, [])
         # The second bot and ordinary messages are independent, even for the same group/user.
@@ -490,7 +550,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.client.text_to_image.side_effect = [main.QiniuSafetyError(400, "safety"), ["generated"]]
         draft = await self.prepare()
         with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="安全的完整替代提示词")):
-            await self.plugin.draw_image(Event(), draft["plan_id"])
+            await self.plugin.draw_image(Event(), draft["plan_id"], caption="test caption~")
             await self.finish()
         self.assertIn("安全的完整替代提示词", await self.plugin.get_last_image_prompt(Event(), full=True))
         self.assertIn("安全的完整替代提示词", await self.plugin.get_drawing_plan(Event(), draft["plan_id"], full=True))
@@ -531,6 +591,53 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlanningResearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_text_conflict_cannot_skip_image_comparison(self):
+        for relation in ("conflict", "unknown", None, "consistent"):
+            ctx = context()
+            planner = planning.DrawingPlanner(ctx)
+            source = FunctionTool("web_search_tavily", "search", {"properties": {"query": {"type": "string"}}, "required": ["query"]})
+            source.call = AsyncMock(return_value='{"url":"https://example.com/kita","features":"Pelham Blue"}')
+
+            async def run(**kwargs):
+                search = kwargs["tools"].tools[0]
+                await search.call(None, drawing_subject="喜多", drawing_known_features="Pelham Blue" if relation == "consistent" else "红色吉他", query="喜多 吉他")
+                result = {"prompt": "喜多背吉他", "summary": "喜多", "image_mode": "none"}
+                if relation is not None:
+                    result["subject_assessments"] = [{"subject": "喜多", "relation": relation,
+                                                       "search_features": "Pelham Blue", "source_urls": ["https://example.com/kita"]}]
+                return response(result)
+
+            ctx.tool_loop_agent.side_effect = run
+            if relation == "consistent":
+                record = await planner.prepare(Event(), "owner", "画喜多", search_tools=[source])
+                self.assertEqual(record["research"][0]["model_features"], "Pelham Blue")
+            else:
+                with self.assertRaises(ValueError):
+                    await planner.prepare(Event(), "owner", "画喜多", search_tools=[source])
+                self.assertFalse(planner.plans)
+            self.assertNotIn("drawing_subject", source.parameters["properties"])
+
+    async def test_empty_search_cannot_claim_consistent_official_features(self):
+        for relation in ("consistent", "unknown", "unavailable"):
+            ctx = context()
+            planner = planning.DrawingPlanner(ctx)
+            source = FunctionTool("web_search_tavily", "search", {})
+            source.call = AsyncMock(return_value="Error: Tavily web searcher does not return any results.")
+
+            async def run(**kwargs):
+                await kwargs["tools"].tools[0].call(None, drawing_subject="喜多", drawing_known_features="红色吉他", query="喜多吉他")
+                return response({"prompt": "喜多，省略不确定的吉他特征", "summary": "搜索无结果，未核实吉他", "image_mode": "none",
+                                 "subject_assessments": [{"subject": "喜多", "relation": relation, "search_features": "", "source_urls": []}]})
+
+            ctx.tool_loop_agent.side_effect = run
+            if relation == "unavailable":
+                record = await planner.prepare(Event(), "owner", "画喜多", search_tools=[source])
+                self.assertEqual(planner.describe(record)["search_failures"], 1)
+                self.assertEqual(planner.describe(record)["subject_assessments"][0]["relation"], "unavailable")
+            else:
+                with self.assertRaisesRegex(ValueError, "没有可用结果"):
+                    await planner.prepare(Event(), "owner", "画喜多", search_tools=[source])
+
     async def test_real_search_then_two_failed_comparisons_returns_reviewable_fallback(self):
         ctx = context(consensus([]))
         planner = planning.DrawingPlanner(ctx, "planner")
@@ -540,21 +647,24 @@ class PlanningResearchTests(unittest.IsolatedAsyncioTestCase):
 
         async def run(**kwargs):
             search, compare = kwargs["tools"].tools
-            await search.call(None, query="甲 外观")
+            await search.call(None, drawing_subject="甲", drawing_known_features="原认识", query="甲 外观")
             first = json.loads(await compare.handler(Event(), "甲", "原认识", "搜索结果", ["https://example.com/1"]))
             self.assertEqual(first["status"], "retry")
             early = json.loads(await compare.handler(Event(), "甲", "原认识", "搜索结果", ["https://example.com/1"]))
             self.assertEqual(early["status"], "research_required")
-            await search.call(None, query="甲 官方立绘 新来源")
+            await search.call(None, drawing_subject="甲", drawing_known_features="不能覆盖", query="甲 官方立绘 新来源")
             second = json.loads(await compare.handler(Event(), "甲", "不能覆盖", "新搜索结果", ["https://example.com/2"]))
             self.assertEqual(second["status"], "fallback")
-            return response({"prompt": "甲坐在海边，不指定外观", "summary": "甲坐在海边；两轮核对无共识，放弃不可靠外观", "image_mode": "none"})
+            return response({"prompt": "甲坐在海边，不指定外观", "summary": "甲坐在海边；两轮核对无共识，放弃不可靠外观", "image_mode": "none",
+                             "subject_assessments": [{"subject": "甲", "relation": "conflict", "search_features": "新搜索结果", "source_urls": ["https://example.com/2"]}]})
 
         ctx.tool_loop_agent.side_effect = run
         with patch.object(references, "download_images", AsyncMock(side_effect=[evidence(), evidence("new")])):
             record = await planner.prepare(Event(), "owner", "画甲", search_tools=[source])
         self.assertEqual(record["checks"][0]["status"], "fallback")
         self.assertEqual(len(record["research"]), 2)
+        self.assertEqual(record["research"][1]["model_features"], "原认识")
+        self.assertEqual(source.call.call_args.kwargs, {"query": "甲 官方立绘 新来源"})
         self.assertTrue(all(call.kwargs["chat_provider_id"] == "planner" for call in ctx.llm_generate.call_args_list))
         self.assertNotIn("research", planner.describe(record))
         self.assertIn("research", planner.describe(record, full=True))
@@ -567,7 +677,7 @@ class PlanningResearchTests(unittest.IsolatedAsyncioTestCase):
 
         async def run(**kwargs):
             search, compare = kwargs["tools"].tools
-            await search.call(None, query="甲")
+            await search.call(None, drawing_subject="甲", drawing_known_features="原认识", query="甲")
             result = json.loads(await compare.handler(Event(), "甲", "原认识", "搜索", ["https://example.com/invented"]))
             self.assertEqual(result["status"], "invalid_sources")
             await compare.handler(Event(), "甲", "原认识", "搜索", ["https://example.com/real"])

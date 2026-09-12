@@ -107,7 +107,7 @@ def _assemble(selection, prompt, *, has_image, image_mode, allowed):
 
 async def integrate(context, umo, prompt, *, has_image, image_mode="auto",
                     style_mode="auto", style_strength="normal", provider_id="",
-                    fallback_provider_ids=()) -> Optional[str]:
+                    fallback_provider_ids=(), selection_out=None) -> Optional[str]:
     """Return the exact source plan plus compatible, existing style text."""
     if not prompt or len(prompt) > 32000 or image_mode not in ("auto", "edit", "reference"):
         return None
@@ -136,4 +136,7 @@ async def integrate(context, umo, prompt, *, has_image, image_mode="auto",
         timeout=LLM_TIMEOUT_SECONDS, attempts_per_provider=2,
         plausible=lambda raw: assemble(raw) is not None, purpose="提示词整合",
     )
-    return assemble(result[0]) if result else None
+    text = assemble(result[0]) if result else None
+    if text and selection_out is not None:
+        selection_out.update(parse_model_json(result[0]))
+    return text
