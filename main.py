@@ -37,6 +37,8 @@ PLANNING_TOOL_TIMEOUT_SECONDS = 55
 _DRAWING_RULES = """
 绘图时先调用 prepare_drawing：交代用户原话、意图、必要人设/指代、硬性要求及允许自由设计的部分。
 区分用户明确要求与你凭记忆补充的角色知识；后者标为待核实认识，不能写成用户指定的核心人设。
+style_request 仅填写用户明确说出的画风原话；用户只说画某角色时留空，不自行添加3D、厚涂、精细CG等风格。
+规划模型会从内置目录选风格再设计画面。用户要求恢复自动选风格时 style_request 填 auto；普通内容修改留空沿用旧风格。
 独立规划模型负责搜索、特征核对和动作构图。检查返回的摘要，不满意则带 base_plan_id 提修改意见；
 确认符合委托后调用 draw_image(plan_id, caption)，不要并行准备与出图，也不用额外询问用户批准。
 caption 由你用当前主 Bot 人格写一句自然的短回复，简单说画谁即可，不写工整的场景解说，不复述摘要。
@@ -55,7 +57,7 @@ pending_review 表示还有未提交的方案，先检查并 draw_image；只有
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "2.2.2",
+    "2.2.3",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -183,7 +185,7 @@ class QiniuImagePlugin(Star):
     @filter.llm_tool(name="prepare_drawing")
     async def prepare_drawing(self, event: AstrMessageEvent, brief: str,
                               base_plan_id: str = "", use_last: bool = False,
-                              image_mode: str = "auto"):
+                              image_mode: str = "auto", style_request: str = ""):
         """静默委托独立模型规划绘图，返回内部审核用的编号和摘要，不向用户播报进度。
 
         Args:
@@ -191,9 +193,12 @@ class QiniuImagePlugin(Star):
             base_plan_id(string): 修改待审方案时填原方案编号，否则留空。
             use_last(boolean): 修改上一张作品时为 true，规划模型直接读取完整提示词，无需复述。
             image_mode(string): 有图时 reference=参考创作、edit=局部修改、auto=按委托判断。
+            style_request(string): 仅用户明确要求的画风原话，没有则留空；恢复自动选风格填 auto，不能凭角色原作补写3D或厚涂。
         """
         if not isinstance(brief, str) or not 1 <= len(brief.strip()) <= 16000:
             return "请提供不超过16000字符的绘图委托。"
+        if not isinstance(style_request, str) or len(style_request) > 1000:
+            return "画风要求仅填写用户明确说出的原话，1000字以内。"
         if image_mode not in ("auto", "edit", "reference") or (base_plan_id and use_last):
             return "图片用途应为 auto/edit/reference；base_plan_id 与 use_last 不能同时使用。"
         owner = self._prompt_key(event)
@@ -208,6 +213,7 @@ class QiniuImagePlugin(Star):
         self._preparing.add(owner)
         try:
             previous_prompt = ""
+            previous_style_id = "none"
             base = None
             if base_plan_id:
                 base = self.planner.get(owner, base_plan_id)
@@ -216,11 +222,13 @@ class QiniuImagePlugin(Star):
                 if base["status"] in ("integrating", "generating"):
                     return "该方案正在出图，请等待完成再修改。"
                 previous_prompt = base.get("final_prompt") or base["prompt"]
+                previous_style_id = base["style_id"]
             elif use_last:
                 last = self._last_image_prompts.get(owner)
                 if not last:
                     return "当前用户没有可沿用的提示词，请提交新的绘图委托。"
                 previous_prompt = str(last["prompt"])
+                previous_style_id = str(last.get("style_id", "none"))
             image_ref = await resolve_input_image(self.context, event, self.client)
             if base and not image_ref:
                 image_ref = base["image_ref"]
@@ -232,10 +240,12 @@ class QiniuImagePlugin(Star):
                 vision_ref=self.client.as_image_reference(image_ref) if image_ref else None,
                 image_mode=image_mode, previous_prompt=previous_prompt,
                 search_tools=self._search_tools.get(owner, ()),
+                style_mode=self.style_mode, style_request=style_request.strip(),
+                previous_style_id=previous_style_id,
             ), timeout=PLANNING_TOOL_TIMEOUT_SECONDS)
             if base and base["status"] == "ready":
                 base["status"] = "superseded"
-            logger.info(f"qiniu-image plan ready | umo={event.unified_msg_origin} plan_id={record['plan_id']} search_count={len(record['research'])}")
+            logger.info(f"qiniu-image plan ready | umo={event.unified_msg_origin} plan_id={record['plan_id']} style_id={record['style_id']} search_count={len(record['research'])}")
             result = self.planner.describe(record)
             result["instruction"] = "静默检查摘要；需修改则重新准备，符合委托后调用 draw_image(plan_id, caption)，caption 用你当前人格自然地说画谁。收到新增请求也要先处理这份方案。"
             return json.dumps(result, ensure_ascii=False)
@@ -317,6 +327,7 @@ class QiniuImagePlugin(Star):
                 style_mode=self.style_mode, style_strength=self.style_strength,
                 provider_id=self.rewrite_provider_id, fallback_provider_ids=self.rewrite_fallback_provider_ids,
                 selection_out=selection,
+                planned_style_id=record["style_id"],
             )
             if not final_prompt:
                 record["status"] = "failed"
@@ -353,6 +364,7 @@ class QiniuImagePlugin(Star):
         yield event.plain_result(
             "本插件的内置绘图风格如下。回答用户时使用中文名称，不要编造目录外的内置风格。\n"
             f"当前模式：{self.style_mode}；强度：{self.style_strength}。\n\n"
+            "函数绘图 auto 偏好：单人/单主体优先错位矩形、诗意窗口等；多人/多主体优先净色动画壁纸。明确指定画风优先。下方为基础目录。\n"
             f"{style_catalog_text(concise=True)}"
         )
 
@@ -518,6 +530,7 @@ class QiniuImagePlugin(Star):
             "summary": plan["summary"] if plan else "关键词直出；完整提示词已保存",
             "adjusted_after_review": bool(plan and plan.get("adjusted_after_review")),
             "style_selection": plan.get("style_selection", {}) if plan else {},
+            "style_id": plan["style_id"] if plan else "none",
         }
         if len(self._last_image_prompts) > 100:
             oldest = min(

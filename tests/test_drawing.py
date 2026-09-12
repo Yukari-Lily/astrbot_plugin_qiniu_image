@@ -99,6 +99,9 @@ references = importlib.import_module("drawing_plugin.subject_reference")
 
 
 def response(value):
+    if isinstance(value, dict) and "prompt" in value and "summary" in value:
+        value = dict(value)
+        value.setdefault("style_id", "none" if value.get("image_mode") == "edit" else "clean_anime_wallpaper")
     return types.SimpleNamespace(completion_text=json.dumps(value, ensure_ascii=False))
 
 
@@ -158,6 +161,49 @@ class Event:
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_logged_hollow_wallpaper_selection_is_rejected_then_core_is_kept(self):
+        ctx = context()
+        hollow = selection()
+        hollow["style_parts"] = [0, 2]  # Observed in the real log: purpose and ratio only.
+        ctx.llm_generate.side_effect = [response(hollow), response(selection())]
+        result = await integrator.integrate(ctx, "g", "喜多背着吉他招手", has_image=False,
+                                            planned_style_id="clean_anime_wallpaper")
+        self.assertIn(integrator.STYLE_PARTS["clean_anime_wallpaper"][1], result)
+        self.assertEqual(ctx.llm_generate.await_count, 2)
+
+    async def test_integrator_cannot_drop_or_replace_reviewed_style(self):
+        for replacement in ("none", "clean_anime_wallpaper"):
+            ctx = context(selection(style=replacement))
+            self.assertIsNone(await integrator.integrate(ctx, "g", "奶龙开心地挥手", has_image=False,
+                                                        planned_style_id="window_overlay_poetic"))
+        chosen = selection(style="window_overlay_poetic")
+        chosen["style_parts"] = [0, 1]
+        ctx = context(chosen)
+        prompt = "奶龙开心地挥手"
+        result = await integrator.integrate(ctx, "g", prompt, has_image=False,
+                                            planned_style_id="window_overlay_poetic")
+        self.assertTrue(result.startswith(prompt + "\n\n"))
+        self.assertIn(integrator.STYLE_PARTS["window_overlay_poetic"][0], result)
+        sent = json.loads(ctx.llm_generate.call_args.kwargs["prompt"])
+        self.assertEqual(list(sent["styles"]), ["window_overlay_poetic"])
+
+    async def test_reviewed_style_can_be_reused_without_duplicate_sections(self):
+        original = await integrator.integrate(context(), "g", "三个人合影", has_image=False,
+                                              planned_style_id="clean_anime_wallpaper")
+        choice = selection(style="none", quality=[])
+        choice["none_reason"] = "existing_style"
+        changed = original.replace("三个人合影", "三个人坐着合影")
+        result = await integrator.integrate(context(choice), "g", changed, has_image=False,
+                                            planned_style_id="clean_anime_wallpaper")
+        self.assertEqual(result, changed)
+
+    async def test_reviewed_explicit_edit_style_does_not_need_name_in_image_prompt(self):
+        result = await integrator.integrate(context(selection("edit")), "g", "只重画帽子",
+                                            has_image=True, image_mode="edit",
+                                            planned_style_id="clean_anime_wallpaper")
+        self.assertIn("只作用于修改区域", result)
+        self.assertIn(integrator.STYLE_PARTS["clean_anime_wallpaper"][1], result)
+
     async def test_selection_audit_matches_exact_assembled_fragments(self):
         audit = {}
         text = await integrator.integrate(context(), "g", "千束招手", has_image=False, selection_out=audit)
@@ -364,6 +410,29 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         full = json.loads(await self.plugin.get_last_image_prompt(event, full=True))
         self.plugin.client.text_to_image.assert_awaited_once_with(full["prompt"])
         self.assertNotIn("prompt", json.loads(await self.plugin.get_last_image_prompt(event)))
+
+    async def test_single_subject_style_choice_reaches_image_and_followup(self):
+        event = Event()
+        self.ctx.tool_loop_agent.return_value = response({"prompt": "喜多挥手，几何窗口留白", "summary": "喜多；诗意窗口", "image_mode": "none", "style_id": "window_overlay_poetic"})
+        choice = selection(style="window_overlay_poetic")
+        choice["style_parts"] = [0, 1]
+        self.ctx.llm_generate.return_value = response(choice)
+        draft = await self.prepare(event)
+        self.assertEqual(draft["style_id"], "window_overlay_poetic")
+        await self.plugin.draw_image(event, draft["plan_id"], caption="喜多喵～")
+        await self.finish()
+        self.assertIn(integrator.STYLE_PARTS["window_overlay_poetic"][0], self.plugin.client.text_to_image.call_args.args[0])
+        self.assertEqual(json.loads(self.ctx.llm_generate.call_args.kwargs["prompt"])["planned_style_id"], "window_overlay_poetic")
+        await self.plugin.prepare_drawing(event, "只改成坐姿", use_last=True)
+        task = json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])
+        self.assertTrue(task["preserve_previous_style"])
+        self.assertEqual(task["previous_style_id"], "window_overlay_poetic")
+        self.assertEqual(task["style_mode"], "auto")
+
+    async def test_explicit_single_person_wallpaper_remains_available(self):
+        draft = json.loads(await self.plugin.prepare_drawing(Event(), "画喜多", style_request="净色动画壁纸"))
+        self.assertEqual(draft["style_id"], "clean_anime_wallpaper")
+        self.assertEqual(json.loads(self.ctx.tool_loop_agent.call_args.kwargs["prompt"])["style_request"], "净色动画壁纸")
 
     async def test_followup_cannot_skip_unsubmitted_plan_and_bots_are_independent(self):
         event = Event()
@@ -591,6 +660,52 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlanningResearchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_cannot_skip_style_because_brief_invents_3d_or_heavy_paint(self):
+        for brief in ("画奶龙，3D CGI动画风格", "画秦彻，日系厚涂", "画全家福，剧场版插画"):
+            ctx = context()
+            ctx.tool_loop_agent.return_value = response({"prompt": brief, "summary": brief, "image_mode": "none", "style_id": "none"})
+            planner = planning.DrawingPlanner(ctx)
+            with self.assertRaisesRegex(ValueError, "auto 必须"):
+                await planner.prepare(Event(), "owner", brief)
+            self.assertFalse(planner.plans)
+
+    async def test_style_is_planned_from_catalog_with_subject_count_preferences(self):
+        ctx = context()
+        ctx.tool_loop_agent.return_value = response({"prompt": "奶龙挥手，留出几何窗口空间", "summary": "奶龙；诗意窗口", "image_mode": "none", "style_id": "window_overlay_poetic"})
+        planner = planning.DrawingPlanner(ctx)
+        record = await planner.prepare(Event(), "owner", "画奶龙，3D动画或插画")
+        task = json.loads(ctx.tool_loop_agent.call_args.kwargs["prompt"])
+        self.assertEqual(len(task["styles"]), 13)
+        self.assertEqual(task["style_request"], "")
+        clean = task["styles"]["clean_anime_wallpaper"]["preference"]
+        for name in ("glitch_rectangles", "window_overlay_poetic"):
+            other = task["styles"][name]["preference"]
+            self.assertLess(clean["single_subject"], other["single_subject"])
+            self.assertGreater(clean["multiple_subjects"], other["multiple_subjects"])
+        self.assertEqual(planner.describe(record)["style_id"], "window_overlay_poetic")
+        ctx.tool_loop_agent.assert_awaited_once()  # Style selection adds no separate model request.
+
+    async def test_explicit_external_style_disabled_and_image_edit_allow_no_preset(self):
+        cases = [({"style_request": "用写实3D渲染"}, "none"), ({"style_mode": "disabled"}, "none"),
+                 ({"style_mode": "explicit_only"}, "none"), ({"image_ref": "https://example.com/user.png", "image_mode": "edit"}, "edit")]
+        for kwargs, mode in cases:
+            ctx = context()
+            result = response({"prompt": "按要求画奶龙", "summary": "奶龙", "image_mode": mode, "style_id": "none"})
+            ctx.tool_loop_agent.return_value = result
+            ctx.llm_generate.return_value = result
+            record = await planning.DrawingPlanner(ctx).prepare(Event(), "owner", "画奶龙", **kwargs)
+            self.assertEqual(record["style_id"], "none")
+
+    async def test_image_reference_requires_preset_and_previous_style_is_preserved(self):
+        ctx = context()
+        ctx.llm_generate.return_value = response({"prompt": "参考图中人物", "summary": "参考原图", "image_mode": "reference", "style_id": "none"})
+        with self.assertRaisesRegex(ValueError, "auto 必须"):
+            await planning.DrawingPlanner(ctx).prepare(Event(), "owner", "参考图", image_ref="https://example.com/user.png")
+        ctx.tool_loop_agent.return_value = response({"prompt": "只改动作", "summary": "新动作", "image_mode": "none", "style_id": "clean_anime_wallpaper"})
+        with self.assertRaises(ValueError):
+            await planning.DrawingPlanner(ctx).prepare(Event(), "owner", "只改动作", previous_prompt="原完整提示词",
+                                                      previous_style_id="window_overlay_poetic")
+
     async def test_text_conflict_cannot_skip_image_comparison(self):
         for relation in ("conflict", "unknown", None, "consistent"):
             ctx = context()

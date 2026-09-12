@@ -12,6 +12,8 @@ from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 
 from .subject_reference import SubjectReferences
 from .model_json import parse_model_json
+from .style_presets import STYLE_PRESETS, find_explicit_presets
+from .prompt_integrator import STYLE_HEADER, QUALITY_HEADER, style_preference
 
 SEARCH_TOOLS = frozenset((
     "web_search_baidu", "web_search_tavily", "tavily_extract_web_page",
@@ -42,9 +44,18 @@ confirmed 只用返回的共同特征，不能重新带入被否定特征；不�
 edit=局部改动其余保持原图，auto 时按委托判断。不得凭常识覆盖图片，无法看图就报告失败。
 修改方案或上一张作品时，提供的 previous_prompt 是完整基稿；只改委托指定部分，保留其他内容。
 换风格时删除旧“画面风格”段；其他修改沿用已有风格及兜底段各一份。不要让修改变成重新随机创作。
-未指定具体画风时留给内置风格，不擅自锁定画风。你只规划，不出图，不发送消息。
+画风先于自由创作确定：先根据主体、用户明确要求和 styles 目录选择一个相容风格，再设计动作、背景、光影。
+从所有相容风格中按题材选择，优先高偏好项；不要一律选目录第一项净色壁纸，不要随机硬套不相容风格。
+preference 是按独立主体数量区分的权重：单人/单主体优先错位矩形、诗意窗口等，净色动画壁纸低优先；多人/多主体时净色动画壁纸高优先。
+衣服、随身配饰和普通背景不单独算主体；用户明确点名的风格及硬性要求优先于权重，单人也可明确指定净色壁纸。
+style_request 是用户明确说出的画风要求；为空时，brief 中主聊天模型添加的“3D/厚涂/电影光影/极致细节”等不是用户指定画风，不得以此排除内置风格。
+角色原作采用3D/厚涂不代表本次要沿用原作媒介，保留角色外观即可。auto 下必须从 styles 选一个方向。
+选好风格后，方案只写可靠主体特征、动作构图与必要场景；按该风格控制细节、光影和留白，不额外堆叠画质套话或另一种渲染媒介。
+styles 提供的风格正文由后续整合器原样追加，不要抄进新方案；你只规划，不出图，不发送消息。
+只有用户明确指定外部画风、局部改图或 styles 为空时可用 style_id=none；不能因自己设计的场景不适合就跳过风格，应调整自由设计部分。
+preserve_previous_style=true 时沿用 previous_style_id 和原基稿画风，不另选；否则换风格时删除旧风格/兜底段，重新按所选风格规划。
 最终只输出 JSON：{"prompt":"完整绘图方案","summary":"供主模型审核的摘要，写出各主体、采用的特征、
-动作构图及画风，指出放弃的特征/不确定性，最多1200字符","image_mode":"none|reference|edit"}。
+动作构图及画风，指出放弃的特征/不确定性，最多1200字符","image_mode":"none|reference|edit","style_id":"所选内置风格id或none"}。
 凡执行过搜索，最终另给 subject_assessments 数组，每个已搜索主体一项：
 {"subject":"搜索时的主体名","relation":"consistent|conflict|unknown|unavailable","search_features":"搜到的特征","source_urls":["本次搜索网址"]}。
 consistent 表示文字一致，conflict 表示有任何冲突（即使已通过图片纠正也仍填 conflict），unknown 表示搜索前无认识。
@@ -110,6 +121,7 @@ class DrawingPlanner:
     @staticmethod
     def describe(record, full=False):
         result = {key: record[key] for key in ("plan_id", "status", "summary", "image_mode")}
+        result["style_id"] = record["style_id"]
         result["checks"] = [{"subject": row["subject"], "status": row["status"], "round": row["round"]}
                             for row in record["checks"]]
         result["search_count"] = len(record["research"])
@@ -128,7 +140,8 @@ class DrawingPlanner:
         return result
 
     async def prepare(self, event, owner, brief, *, image_ref=None, vision_ref=None, image_mode="auto",
-                      previous_prompt="", search_tools=()):
+                      previous_prompt="", search_tools=(), style_mode="auto", style_request="",
+                      previous_style_id="none"):
         provider = self.provider_id or await self.context.get_current_chat_provider_id(umo=event.unified_msg_origin)
         if not provider:
             raise ValueError("没有可用的绘图规划模型")
@@ -172,7 +185,17 @@ class DrawingPlanner:
                     "required": ["subject", "model_features", "search_features", "source_urls"]},
                 handler=compare,
             ))
+        preserve_style = bool(previous_prompt) and not style_request
+        requested = find_explicit_presets(style_request)
+        presets = STYLE_PRESETS if style_mode == "auto" else requested if style_mode == "explicit_only" else ()
+        if preserve_style:
+            presets = tuple(p for p in STYLE_PRESETS if p.id == previous_style_id)
+        catalog = {p.id: {"name": p.name, "suitable_for": p.suitable_for,
+                          "avoid_when": p.avoid_when, "preference": style_preference(p),
+                          "prompt": p.prompt} for p in presets}
         task = json.dumps({"brief": brief, "previous_prompt": previous_prompt,
+                           "styles": catalog, "style_mode": style_mode, "style_request": style_request,
+                           "preserve_previous_style": preserve_style, "previous_style_id": previous_style_id,
                            "has_image": bool(image_ref), "image_mode": image_mode,
                            "has_search": bool(search_tools) and not image_ref}, ensure_ascii=False)
         kwargs = dict(chat_provider_id=provider, prompt=task, system_prompt=PLANNING_RULES, contexts=[])
@@ -225,6 +248,18 @@ class DrawingPlanner:
             raise ValueError("规划模型返回了错误的图片模式")
         if image_ref and image_mode != "auto" and mode != image_mode:
             raise ValueError("规划模型改变了指定的图片用途")
+        style_id = result.get("style_id")
+        if not isinstance(style_id, str) or style_id not in (*catalog, "none"):
+            raise ValueError("规划模型未选择有效的内置风格，请先选风格再设计画面")
+        if preserve_style:
+            if style_id != previous_style_id:
+                raise ValueError("本次未要求换画风，不能改变原有风格")
+        elif style_id == "none" and catalog and mode != "edit" and not (style_request and style_request != "auto"):
+            raise ValueError("auto 必须选用内置风格，不能用自行补充的画风跳过")
+        elif (not previous_prompt or style_request) and (STYLE_HEADER in result["prompt"] or QUALITY_HEADER in result["prompt"]):
+            raise ValueError("新方案不得自行填写风格/兜底段，应由整合器原样追加")
+        if mode == "edit" and style_id != "none" and not style_request and not preserve_style:
+            raise ValueError("局部修改不得擅自改变原图画风")
         checks = [state["result"] for state in checker.rounds.values() if "result" in state]
         for check in checks:
             if check["status"] == "confirmed" and check["features"] not in result["prompt"]:
@@ -242,6 +277,7 @@ class DrawingPlanner:
             self.plans.pop(oldest)
         plan_id = uuid.uuid4().hex[:16]
         record = dict(result, plan_id=plan_id, owner=owner, brief=brief, image_ref=image_ref,
+                      style_request=style_request,
                       research=research["calls"], checks=checks, has_search=bool(search_tools),
                       created=time.monotonic(), size=size, status="ready")
         self.plans[plan_id] = record
