@@ -13,6 +13,7 @@ import aiohttp
 from astrbot.api import logger
 
 from .qiniu_api import _image_mime
+from .model_json import parse_model_json
 
 MAX_BYTES = 8 * 1024 * 1024
 
@@ -181,7 +182,7 @@ class SubjectReferences:
                                                       for row in fresh]}, ensure_ascii=False),
                         image_urls=[row["data"] for row in fresh],
                     ), timeout=45)
-                    result = json.loads(response.completion_text)
+                    result = parse_model_json(response.completion_text)
             features = self._consensus(result, state["model_features"], search_features)
             if features:
                 payload = {"status": "confirmed", "features": features,

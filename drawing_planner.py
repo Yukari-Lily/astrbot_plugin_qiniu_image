@@ -10,6 +10,7 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 
 from .subject_reference import SubjectReferences
+from .model_json import parse_model_json
 
 SEARCH_TOOLS = frozenset((
     "web_search_baidu", "web_search_tavily", "tavily_extract_web_page",
@@ -40,6 +41,7 @@ edit=局部改动其余保持原图，auto 时按委托判断。不得凭常识�
 未指定具体画风时留给内置风格，不擅自锁定画风。你只规划，不出图，不发送消息。
 最终只输出 JSON：{"prompt":"完整绘图方案","summary":"供主模型审核的摘要，写出各主体、采用的特征、
 动作构图及画风，指出放弃的特征/不确定性，最多1200字符","image_mode":"none|reference|edit"}。
+另给 caption 字段：一句不超过60字的用户说明，只简述主体、动作/场景，不提规划、核对、模型、队列或预计完成时间，不声称图片已经画好。
 summary 必须忠实反映完整方案，不能掩盖与委托不符的决定。用户明确要求和原样文字必须保留。
 """.strip()
 
@@ -154,10 +156,7 @@ class DrawingPlanner:
                 event=event, tools=tools, max_steps=20, tool_call_timeout=80, **kwargs), timeout=105)
         if checker.pending("plan") or unresolved:
             raise ValueError("规划模型未完成第二轮核对，请重新准备方案")
-        raw = response.completion_text.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw)
-        result = json.loads(raw)
+        result = parse_model_json(response.completion_text)
         if not isinstance(result, dict):
             raise ValueError("规划模型未返回有效方案")
         for field, limit in (("prompt", 30000), ("summary", 1200)):

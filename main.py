@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 import traceback
 from typing import Dict, List, Optional, Set, Tuple
@@ -31,6 +32,8 @@ from .qiniu_api import (
 from .style_presets import STYLE_MODES, STYLE_STRENGTHS, style_catalog_text
 
 DEDUP_TTL_SECONDS = 20
+_SILENT_DRAWING = "qiniu_image_silent_drawing"
+PLANNING_TOOL_TIMEOUT_SECONDS = 55
 
 _DRAWING_RULES = """
 绘图时先调用 prepare_drawing：交代用户意图、必要人设/指代、硬性要求及允许自由设计的部分。
@@ -38,13 +41,16 @@ _DRAWING_RULES = """
 确认符合委托后调用 draw_image(plan_id)，不要并行准备与出图，也不用额外询问用户批准。
 修改上一张作品可用 use_last=true，让规划模型直接读取完整缓存；必要时用 get_drawing_plan(full=true)
 或 get_last_image_prompt(full=true) 查看全文和依据。默认只返回摘要，accepted 后等自动发图，不重复调用。
+整个绘图工具链静默执行：调用工具前后都不要发“稍等、正在规划、方案已确认、重试、后台加速”等过程消息，
+不要复述内部摘要或错误堆栈。完整提示词准备好后插件会统一发一句画面说明并发送图片，你无需再补回复。
+失败时只简短说明失败原因，不要承诺已经在出图或“马上就来”。
 """.strip()
 
 @register(
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
     "七牛 AI 绘图 / 改图",
-    "2.2.0",
+    "2.2.1",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
@@ -155,11 +161,20 @@ class QiniuImagePlugin(Star):
     def _prompt_key(self, event):
         return json.dumps([str(event.unified_msg_origin), str(event.get_sender_id())])
 
+    @filter.on_decorating_result()
+    async def suppress_drawing_chatter(self, event):
+        """Only suppress this drawing turn's LLM chatter; plugin deliveries bypass this hook."""
+        if not event.get_extra(_SILENT_DRAWING, False):
+            return
+        result = event.get_result()
+        if result and result.is_llm_result():
+            result.chain.clear()
+
     @filter.llm_tool(name="prepare_drawing")
     async def prepare_drawing(self, event: AstrMessageEvent, brief: str,
                               base_plan_id: str = "", use_last: bool = False,
                               image_mode: str = "auto"):
-        """委托独立模型规划绘图，返回待审核的方案编号和摘要，不出图。
+        """静默委托独立模型规划绘图，返回内部审核用的编号和摘要，不向用户播报进度。
 
         Args:
             brief(string): 用户意图、已解析的指代/必要人设、硬性要求和创作自由度；修改时写具体意见。
@@ -173,6 +188,7 @@ class QiniuImagePlugin(Star):
             return "图片用途应为 auto/edit/reference；base_plan_id 与 use_last 不能同时使用。"
         owner = self._prompt_key(event)
         if owner in self._preparing:
+            event.set_extra(_SILENT_DRAWING, True)
             return '{"status":"pending","instruction":"已有方案正在准备，请等待。"}'
         self._preparing.add(owner)
         try:
@@ -195,21 +211,23 @@ class QiniuImagePlugin(Star):
                 image_ref = base["image_ref"]
                 if image_mode == "auto" and image_ref:
                     image_mode = base["image_mode"]
-            record = await self.planner.prepare(
+            event.set_extra(_SILENT_DRAWING, True)
+            record = await asyncio.wait_for(self.planner.prepare(
                 event, owner, brief.strip(), image_ref=image_ref,
                 vision_ref=self.client.as_image_reference(image_ref) if image_ref else None,
                 image_mode=image_mode, previous_prompt=previous_prompt,
                 search_tools=self._search_tools.get(owner, ()),
-            )
+            ), timeout=PLANNING_TOOL_TIMEOUT_SECONDS)
             if base and base["status"] == "ready":
                 base["status"] = "superseded"
             result = self.planner.describe(record)
-            result["instruction"] = "检查摘要；需要修改则带 base_plan_id 重新准备，符合委托后调用 draw_image(plan_id)。"
+            result["instruction"] = "静默检查摘要，不要向用户复述或播报进度；需要修改则重新准备，符合委托后直接调用 draw_image(plan_id)。"
             return json.dumps(result, ensure_ascii=False)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning(f"qiniu-image: 规划失败（{type(exc).__name__}）")
+            event.set_extra(_SILENT_DRAWING, False)
             return "规划失败：" + (str(exc) if isinstance(exc, ValueError) else "规划模型或工具不可用/超时，请重试。")
         finally:
             self._preparing.discard(owner)
@@ -229,22 +247,31 @@ class QiniuImagePlugin(Star):
 
     @filter.llm_tool(name="draw_image")
     async def draw_image(self, event: AstrMessageEvent, plan_id: str):
-        """确认已检查规划摘要并执行该方案。只接受方案编号，不能绕过规划直接提交提示词。
+        """静默确认并提交方案，立即返回；后台整合提示词和出图。不要另发确认、等待或重试消息。
 
         Args:
             plan_id(string): 已检查并符合用户委托的 prepare_drawing 方案编号。
         """
         if not self.client.configured:
+            event.set_extra(_SILENT_DRAWING, False)
             return "生成失败喵（未配置 api_key）"
         owner = self._prompt_key(event)
         record = self.planner.get(owner, plan_id)
         if not record:
             return "请先调用 prepare_drawing 并检查返回的摘要，再提交有效方案编号。"
+        event.set_extra(_SILENT_DRAWING, True)
         if record["status"] != "ready":
             return json.dumps({"status": record["status"], "plan_id": plan_id,
                                "instruction": "不要重复出图；如需修改或重画，请准备新方案。"}, ensure_ascii=False)
         record["status"] = "integrating"
-        queued = False
+        task = asyncio.create_task(self._integrate_and_push(event, record))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return json.dumps({"status": "accepted", "plan_id": plan_id, "phase": "integrating",
+                           "instruction": "静默等待，勿再回复用户或重复调用。插件会在完整提示词准备好后只发一句画面说明，再自动发图。"}, ensure_ascii=False)
+
+    async def _integrate_and_push(self, event, record):
+        """Keep provider fallbacks outside AstrBot's tool timeout, with exactly one caption."""
         try:
             final_prompt = await integrate(
                 self.context, event.unified_msg_origin, record["prompt"], has_image=bool(record["image_ref"]),
@@ -253,19 +280,35 @@ class QiniuImagePlugin(Star):
                 provider_id=self.rewrite_provider_id, fallback_provider_ids=self.rewrite_fallback_provider_ids,
             )
             if not final_prompt:
-                return "生成失败喵（提示词整合模型不可用或整合后超出长度限制）"
+                record["status"] = "failed"
+                await self._push_text(event, "生成失败喵（提示词整合暂时不可用）")
+                return
             record["final_prompt"] = final_prompt
             record["status"] = "generating"
             self._remember_image_prompt(event, final_prompt, has_image=bool(record["image_ref"]), plan=record)
-            task = asyncio.create_task(self._draw_and_push(event, final_prompt, image_ref=record["image_ref"], plan=record))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
-            queued = True
-        finally:
-            if not queued:
-                record["status"] = "ready"
-        return json.dumps({"status": "accepted", "plan_id": plan_id,
-                           "instruction": "完整提示词已保存，等待自动发图，不重复调用。"}, ensure_ascii=False)
+            await self._push_text(event, self._drawing_caption(record))
+            await self._draw_and_push(event, final_prompt, image_ref=record["image_ref"], plan=record)
+        except asyncio.CancelledError:
+            record["status"] = "cancelled"
+            raise
+        except Exception as exc:
+            record["status"] = "failed"
+            logger.error(f"qiniu-image: 后台整合失败（{type(exc).__name__}）")
+            await self._push_text(event, "生成失败喵，请稍后重试")
+
+    @staticmethod
+    def _drawing_caption(record):
+        caption = record.get("caption")
+        if not isinstance(caption, str) or not caption.strip() or len(caption.strip()) > 60:
+            caption = re.split(r"[。！？\n]", record["summary"], maxsplit=1)[0]
+        caption = " ".join(caption.split()).strip("。！？ ")
+        return caption[:59].rstrip("，、； ") + "。"
+
+    async def _push_text(self, event, text):
+        try:
+            await self.context.send_message(event.unified_msg_origin, MessageChain().message(text))
+        except Exception as exc:
+            logger.warning(f"qiniu-image: 发送绘图消息失败（{type(exc).__name__}）")
 
     @filter.llm_tool(name="list_image_styles")
     async def list_image_styles(self, event: AstrMessageEvent):

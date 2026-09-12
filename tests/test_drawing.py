@@ -56,7 +56,7 @@ sys.modules["astrbot.api"].AstrBotConfig = dict
 sys.modules["astrbot.api.event"].AstrMessageEvent = object
 sys.modules["astrbot.api.event"].MessageChain = Chain
 sys.modules["astrbot.api.event"].filter = types.SimpleNamespace(
-    llm_tool=decorator, on_llm_request=decorator, event_message_type=decorator,
+    llm_tool=decorator, on_llm_request=decorator, on_decorating_result=decorator, event_message_type=decorator,
     EventMessageType=types.SimpleNamespace(ALL="all"),
     PlatformAdapterType=types.SimpleNamespace(AIOCQHTTP="aiocqhttp"))
 sys.modules["astrbot.api.star"].Star = Star
@@ -123,6 +123,17 @@ class Event:
         self.user, self.images, self.message_str = user, images, text
         self.message_obj = types.SimpleNamespace(message_id=mid)
         self.stopped = False
+        self.extras = {}
+        self.result = None
+
+    def set_extra(self, key, value):
+        self.extras[key] = value
+
+    def get_extra(self, key, default=None):
+        return self.extras.get(key, default)
+
+    def get_result(self):
+        return self.result
 
     def get_sender_id(self):
         return self.user
@@ -147,6 +158,22 @@ class Event:
 
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_fenced_json_is_accepted_on_first_attempt(self):
+        for fence in ("json", "JSON", ""):
+            ctx = context()
+            ctx.llm_generate.return_value = types.SimpleNamespace(
+                completion_text="```" + fence + "\n" + json.dumps(selection()) + "\n```")
+            text = await integrator.integrate(ctx, "group", "千束在街边微笑", has_image=False)
+            self.assertTrue(text.startswith("千束在街边微笑"))
+            ctx.llm_generate.assert_awaited_once()
+
+    async def test_fences_do_not_bypass_content_validation(self):
+        ctx = context()
+        bad = selection()
+        bad["style_parts"] = [999]
+        ctx.llm_generate.return_value = types.SimpleNamespace(completion_text="```json\n" + json.dumps(bad) + "\n```")
+        self.assertIsNone(await integrator.integrate(ctx, "g", "甲", has_image=False))
+
     async def test_subjects_actions_composition_and_text_are_preserved_exactly(self):
         plan = '左边甲：银发红瞳，右边乙：黑发金瞳；两人背靠背。标题逐字写“净色动画壁纸”。'
         ctx = context()
@@ -403,12 +430,61 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names, ["web_search_tavily", "compare_subject_reference"])
         self.assertNotIn("①", main._DRAWING_RULES)
 
-    async def test_failed_integration_leaves_draft_retryable(self):
+    async def test_failed_integration_sends_one_failure_without_claiming_generation(self):
         draft = await self.prepare()
         with patch.object(main, "integrate", AsyncMock(return_value=None)):
             await self.plugin.draw_image(Event(), draft["plan_id"])
-        self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["status"], "ready")
+            await self.finish()
+        self.assertEqual(self.plugin.planner.plans[draft["plan_id"]]["status"], "failed")
         self.plugin.client.text_to_image.assert_not_awaited()
+        self.ctx.send_message.assert_awaited_once()
+        self.assertIn("生成失败", self.ctx.send_message.call_args.args[1].text)
+        self.assertNotIn(self.plugin._prompt_key(Event()), self.plugin._last_image_prompts)
+
+    async def test_slow_integration_returns_immediately_and_cannot_be_started_twice(self):
+        event = Event()
+        draft = await self.prepare(event)
+        record = self.plugin.planner.plans[draft["plan_id"]]
+        record["caption"] = "千束在阳光下的街边微笑招手。"
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def slow(*args, **kwargs):
+            started.set()
+            await release.wait()
+            return "完整提示词：千束在街边微笑招手"
+
+        with patch.object(main, "integrate", slow):
+            accepted = json.loads(await asyncio.wait_for(self.plugin.draw_image(event, draft["plan_id"]), timeout=.1))
+            await started.wait()
+            self.assertEqual(accepted["phase"], "integrating")
+            self.ctx.send_message.assert_not_awaited()
+            self.plugin.client.text_to_image.assert_not_awaited()
+            self.assertNotIn(self.plugin._prompt_key(event), self.plugin._last_image_prompts)
+            duplicate = json.loads(await self.plugin.draw_image(event, draft["plan_id"]))
+            self.assertEqual(duplicate["status"], "integrating")
+            self.assertEqual(len(self.plugin._tasks), 1)
+            release.set()
+            await self.finish()
+        deliveries = self.ctx.send_message.call_args_list
+        self.assertEqual(len(deliveries), 2)
+        self.assertEqual(deliveries[0].args[1].text, record["caption"])
+        self.assertEqual(deliveries[1].args[1].image, "generated")
+        self.plugin.client.text_to_image.assert_awaited_once_with(record["final_prompt"])
+
+    async def test_drawing_chatter_is_suppressed_only_for_its_event(self):
+        event = Event()
+        await self.prepare(event)
+        event.result = types.SimpleNamespace(chain=["方案核对完成，马上出图"], is_llm_result=lambda: True)
+        await self.plugin.suppress_drawing_chatter(event)
+        self.assertEqual(event.result.chain, [])
+        # The second bot and ordinary messages are independent, even for the same group/user.
+        other = Event()
+        other.result = types.SimpleNamespace(chain=["正常聊天"], is_llm_result=lambda: True)
+        await self.plugin.suppress_drawing_chatter(other)
+        self.assertEqual(other.result.chain, ["正常聊天"])
+        event.result = types.SimpleNamespace(chain=["插件图片"], is_llm_result=lambda: False)
+        await self.plugin.suppress_drawing_chatter(event)
+        self.assertEqual(event.result.chain, ["插件图片"])
 
     async def test_safety_retry_updates_plan_and_last_full_prompt(self):
         self.plugin.client.text_to_image.side_effect = [main.QiniuSafetyError(400, "safety"), ["generated"]]
@@ -421,9 +497,15 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("notice", json.loads(await self.plugin.get_last_image_prompt(Event())))
 
     async def test_planning_timeout_releases_guard_and_never_submits_image(self):
-        self.ctx.tool_loop_agent.side_effect = asyncio.TimeoutError()
-        result = await self.plugin.prepare_drawing(Event(), "画猫")
+        async def slow(**kwargs):
+            await asyncio.Event().wait()
+
+        self.ctx.tool_loop_agent.side_effect = slow
+        event = Event()
+        with patch.object(main, "PLANNING_TOOL_TIMEOUT_SECONDS", .01):
+            result = await asyncio.wait_for(self.plugin.prepare_drawing(event, "画猫"), timeout=.2)
         self.assertIn("超时", result)
+        self.assertFalse(event.get_extra(main._SILENT_DRAWING))
         self.assertFalse(self.plugin._preparing)
         self.assertFalse(self.plugin.planner.plans)
         self.plugin.client.text_to_image.assert_not_awaited()

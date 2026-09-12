@@ -5,6 +5,7 @@ import re
 from typing import Optional
 
 from .prompt_rewriter import _resolve_provider_ids, _try_providers, LLM_TIMEOUT_SECONDS
+from .model_json import parse_model_json
 from .style_presets import QUALITY_GUIDANCE, STYLE_PRESETS, find_explicit_presets
 
 
@@ -124,7 +125,7 @@ async def integrate(context, umo, prompt, *, has_image, image_mode="auto",
 
     def assemble(raw):
         try:
-            selection = json.loads(raw)
+            selection = parse_model_json(raw)
         except (ValueError, TypeError):
             return None
         return _assemble(selection, prompt, has_image=has_image,
