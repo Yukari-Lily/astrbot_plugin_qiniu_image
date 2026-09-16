@@ -2,10 +2,9 @@
 
 import re
 from dataclasses import dataclass
-from typing import List, Sequence, Tuple
+from typing import List, Tuple
 
 
-STYLE_MODES = ("auto", "explicit_only", "disabled")
 STYLE_STRENGTHS = ("subtle", "normal", "strong")
 
 
@@ -22,12 +21,13 @@ QUALITY_GUIDANCE = """
 4. 严格抑制脏乱廉价感：浑浊棕黑覆盖、油腻厚重笔触、灰脏肤色、无目的颗粒磨损、过量锐化、杂乱背景、无层次高频细节、互相打架的光源、堆叠过量的故障与特效。
 5. 日系动漫、漫画或游戏角色使用官方日文作品名和角色名；画内需要标题或装饰文字时只使用准确的官方日文原文，或输入方案明确指定的文字，不使用中文译名或中文装饰字。不要擅自添加无意义文字。
 6. 若题材不是二次元人物（例如商品、美食、建筑或输入方案明确要求摄影），选择适合题材的专业视觉语言，但仍保持干净、克制和清晰层级。
-7. “masterpiece、best quality、highly detailed、anime style、cinematic、8k、插画、高清”等只是泛化质量词，不属于输入方案指定的完整画风，不能用它们作为跳过内置风格的理由。
 """.strip() + "\n" + CLEAN_LINE_GUIDANCE
 
 
 SAFE_REFRAME_GUIDANCE = """
-安全转译规则：目标是在不放弃出图的前提下，优先通过措辞层面让提示词通过审核：先用含蓄、同义或隐晦的词语重述，保持原画面（服装、场景、姿势、构图）不变；只有措辞调整仍被拒绝时，才按递进级别逐步收敛画面。优先以二次元插画语境表达（动画角色插画、角色立绘、轻小说/漫画封面、动画剧照、角色设计图、时尚杂志内页插画），不要将私密场景、暴露服装与挑逗姿势叠加组合，至少弱化其中一项。遇到色情、裸露、透明衣物、脱衣或明显性暗示时，可将其转译为非露骨、非色情、衣着完整的审美替代方案，并保留仍然安全的主体身份、配色、场景、情绪和构图意图；可改为端庄睡衣、完整家居服、时尚写真、浪漫氛围或含蓄而不性化的姿态。不要保留裸体、可见私密部位、性行为、恋物特写或对未成年/年龄不明角色的性化表达。对年轻外貌或年龄不明的角色尤其使用端庄服装和非挑逗姿态。只输出可直接送入图片模型的安全提示词，不要道歉、解释政策或拒绝。
+安全转译规则：目标是在不放弃出图的前提下，优先通过措辞层面让提示词通过审核：先用含蓄、同义或隐晦的词语重述，保持原画面（服装、场景、姿势、构图）不变；只有措辞调整仍被拒绝时，才按递进级别逐步收敛画面。优先以二次元插画语境表达（动画角色插画、角色立绘、轻小说/漫画封面、动画剧照、角色设计图、时尚杂志内页插画），不要将私密场景、暴露服装与挑逗姿势叠加组合，至少弱化其中一项。遇到色情、裸露、透明衣物、脱衣或明显性暗示时，可将其转译为非露骨、非色情、衣着完整的审美替代方案，并保留主体身份（角色名、作品名、外观设定与人数）与尽可能多的配色、场景、情绪和构图意图；可改为端庄睡衣、完整家居服、时尚写真、浪漫氛围或含蓄而不性化的姿态。不要保留裸体、可见私密部位、性行为、恋物特写或对未成年/年龄不明角色的性化表达。对年轻外貌或年龄不明的角色尤其使用端庄服装和非挑逗姿态。
+保真约束：改写不是重新创作。被拒绝的原因是成人内容，不是主体——不要把主体、角色名、作品名、人数替换、删减或泛化成别的角色。必须使用与被拒绝提示词相同的书写语言，原文是中文就输出中文，是日文就输出日文，不得整体改写成英文。必须逐字保留原文中的角色名、作品名、产品名等专有名词。不得改变原文的动作、构图层级和场景意图；只允许弱化或收敛与审核相关的着装与体态描述。
+只输出可直接送入图片模型的安全提示词，不要道歉、解释政策或拒绝。
 """.strip()
 
 
@@ -47,8 +47,8 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
         id="clean_anime_wallpaper",
         name="净色动画壁纸",
         aliases=("净色动画电脑壁纸", "清爽动画壁纸", "极简净色壁纸"),
-        suitable_for="动画角色电脑壁纸、干净构图与配色、低细节密度、大色块和充足留白",
-        avoid_when="输入方案明确要求繁复纹理、密集拼贴、写实摄影或高信息密度海报",
+        suitable_for="至少两名人物的合影或群像壁纸；干净配色、大色块和充足留白，仅作低优先候选",
+        avoid_when="单人、无人、人数不明；即使指定单人壁纸也不用。不得为使用本风格添加人物；繁复纹理、密集拼贴或写实摄影也不适用",
         prompt=(
             "生成一张构图和色彩非常干净的电脑壁纸，电脑壁纸的主要角色是动画角色。"
             "large simple color masses, low visual frequency, restrained edge density, "
@@ -57,7 +57,7 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
             "以少量协调的纯净色块和宽阔留白突出角色，外轮廓清楚、内部线条精简，"
             "适合桌面图标的安静背景；电脑壁纸默认横向构图，输入方案指定比例或用途时以其要求为准。"
         ),
-        auto_preference=2,
+        auto_preference=-1,
     ),
     StylePreset(
         id="literary_commerce",
@@ -212,137 +212,95 @@ STYLE_PRESETS: Tuple[StylePreset, ...] = (
 )
 
 
-def _match_key(text: str) -> str:
-    return re.sub(r"[\s+＋·・_—\-/]+", "", text).casefold()
+def preference_label(preset: StylePreset) -> str:
+    """风格在自动偏好里的档位，供目录行与工具说明逐字复用。"""
+    if preset.auto_preference < 0:
+        return "低优先（仅限至少两名人物）"
+    if not preset.auto_preference:
+        return "普通"
+    return "默认优先"
 
 
-def find_explicit_presets(user_prompt: str) -> Tuple[StylePreset, ...]:
-    """按名称或别名找用户明确点名的风格，不负责语义猜测。"""
-    prompt_key = _match_key(user_prompt)
-    if not prompt_key:
-        return ()
-    return tuple(
-        preset
-        for preset in STYLE_PRESETS
-        if any(_match_key(alias) in prompt_key for alias in (preset.name, *preset.aliases))
-    )
-
-
-def _catalog_lines(presets: Sequence[StylePreset]) -> List[str]:
+def style_catalog_text(*, include_prompts: bool = False) -> str:
+    """供聊天工具与文档复用的风格目录；id 是出图时唯一可用的风格标识。"""
     lines: List[str] = []
-    for preset in presets:
-        aliases = "、".join(preset.aliases)
-        lines.extend(
-            (
-                f"- {preset.name}（id: {preset.id}；别名：{aliases}；自动偏好：{'高' if preset.auto_preference else '普通'}）",
-                f"  适合：{preset.suitable_for}",
-                f"  避免：{preset.avoid_when}",
-                f"  视觉片段：{preset.prompt}",
-            )
-        )
-    return lines
-
-
-def style_catalog_text(*, concise: bool = False) -> str:
-    """供聊天工具与文档复用的风格目录，保持与实际预设同源。"""
-    if concise:
-        return "\n".join(
-            f"- {preset.name}：{preset.suitable_for}" for preset in STYLE_PRESETS
-        )
-    return "\n".join(_catalog_lines(STYLE_PRESETS))
-
-
-_STYLE_MARKER_RE = re.compile(
-    r"\[\[\s*STYLE_PRESET\s*:\s*([a-z0-9_-]+)\s*\]\]",
-    re.IGNORECASE,
-)
-
-
-def clean_style_metadata(text: str) -> Tuple[str, Tuple[StylePreset, ...]]:
-    """移除内部风格标记及风格名称，避免图片模型把名称画成文字。"""
-    preset_by_id = {preset.id: preset for preset in STYLE_PRESETS}
-    selected: List[StylePreset] = []
-    for preset_id in _STYLE_MARKER_RE.findall(text):
-        preset = preset_by_id.get(preset_id.casefold())
-        if preset and preset not in selected:
-            selected.append(preset)
-
-    cleaned = _STYLE_MARKER_RE.sub("", text)
-    labels = sorted(
-        {
-            label
-            for preset in STYLE_PRESETS
-            for label in (preset.name, *preset.aliases)
-            if label
-        },
-        key=len,
-        reverse=True,
-    )
-    for label in labels:
-        pattern = re.escape(label).replace(r"\ ", r"\s*")
-        cleaned = re.sub(
-            rf"{pattern}(?:\s*(?:风格|美学|视觉风格))?",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
-        )
-
-    cleaned = re.sub(
-        r"^[\s,，。:：;；、\-—·|/]*(?:(?:style|风格|美学)\s*[,，。:：;；、\-—·|/]*)?",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
-    return cleaned, tuple(selected)
-
-
-def build_style_guidance(
-    user_prompt: str,
-    *,
-    mode: str,
-    strength: str,
-    has_image: bool,
-) -> str:
-    """构造给优化模型看的风格路由规则。"""
-    if mode == "disabled":
-        return ""
-
-    explicit = find_explicit_presets(user_prompt)
-    if mode == "explicit_only" and not explicit:
-        return ""
-
-    presets: Sequence[StylePreset] = (
-        sorted(STYLE_PRESETS, key=lambda preset: preset.auto_preference, reverse=True)
-        if mode == "auto"
-        else explicit
-    )
-    strength_rule = {
-        "subtle": "只借用少量最有辨识度的视觉特征，不让风格压过主体和内容。",
-        "normal": "完整使用核心视觉语言，但删除与输入方案无关或冲突的细节。",
-        "strong": "在不改变输入方案硬性要求的前提下，充分使用所选风格的构图、色彩和材质语言。",
-    }[strength]
-
-    lines = [
-        "",
-        "以下是内置风格库及路由规则。风格库是可选参考，不是必须全部加入的关键词列表：",
-        "1. 输入方案明确点名某个内置风格且不是在否定它时，优先采用该风格。",
-        "2. 输入方案明确给出具体且有辨识度的其他画风时，忠实保留并停止自动叠加内置风格。",
-        "3. 输入方案由主聊天模型基于人设、上下文、角色考据和创作委托形成，其中确定的画风、构图及视觉选择必须保留。anime style、highly detailed、masterpiece、cinematic、插画、高清等泛化词不算具体风格。",
-        "4. 输入方案未确定具体画风时，主动选择一个相容的内置风格；已有明确视觉方案时不要另套模板。方案要求换风格时参照其中记录的上一版风格选择不同方案；仅在完整风格与主体或硬性要求冲突时借用部分特征。",
-        "5. 多个风格都适合时，优先选择标记为“自动偏好：高”的风格；只有输入方案明确要求纯写实、忠实复刻原画风、不要风格化，或全部候选都明显冲突时才选择零个。",
-        "6. 最多选择一个风格，不混合多个内置风格。输入方案中的主体身份、品牌、商品、数量、动作、场景、构图和配色等明确要求永远优先；方案要求画进图片的文字必须逐字保留。",
-        "7. 只吸收所选风格中适用的视觉属性，不复制示例主体，不添加输入方案未包含的角色、品牌、文字或物件。",
-        "8. 把所选风格的构图、色彩、线条、材质等视觉属性自然展开写入提示词；正文中绝对不要写出风格的中文名称、别名或 id，避免图片模型把名称画进画面。",
-        "9. 仅在输出开头添加插件内部标记 [[STYLE_PRESET:id]]，其中 id 替换为所选风格 id；未选择内置风格时使用 [[STYLE_PRESET:none]]。这是上一条的唯一例外，标记只供插件读取，不能代替视觉描述，插件会在出图前删除它。",
-        "10. 严格遵守另外提供的全局审美与质量提示，内置风格不能覆盖其中的约束。",
-        f"11. 当前风格强度：{strength}。{strength_rule}",
-    ]
-    if has_image:
-        lines.append("12. 当前是改图：除非输入方案明确点名风格或要求整体重绘/风格化，否则不要改变原图画风。")
-    if explicit:
-        names = "、".join(preset.name for preset in explicit)
-        lines.append(f"检测到输入方案可能明确提及：{names}。仍需识别否定语义，并以方案整体含义为准。")
-    lines.append("\n可选风格：")
-    lines.extend(_catalog_lines(presets))
+    for preset in sorted(STYLE_PRESETS, key=lambda item: item.auto_preference, reverse=True):
+        lines.extend((
+            f"- {preset.name}（id: {preset.id}；{preference_label(preset)}）",
+            f"  适合：{preset.suitable_for}",
+            f"  避免：{preset.avoid_when}",
+        ))
+        if include_prompts:
+            lines.append(f"  别名：{'、'.join(preset.aliases)}")
+            lines.append(f"  风格参考（只将适用的视觉属性自然融入执行提示词，不复制名称或整段模板）：{preset.prompt}")
     return "\n".join(lines)
+
+
+_LEGACY_STYLE_LEADS = {
+    "subtle": "画面风格（只作轻微参考，不得改变上述主体、动作、构图与明确要求）：",
+    "normal": "画面风格（不得改变上述主体、动作、构图与明确要求）：",
+    "strong": "画面风格（不得改变上述主体、动作、构图与明确要求，可以此风格主导画面语言）：",
+}
+STYLE_LEADS = {
+    "subtle": "内置画风（保留预设的媒介、配色与视觉结构，仅减轻表现强度；用户明确要求优先）：",
+    "normal": "内置画风（完整遵照以下预设的媒介、配色、纹理与视觉结构；用户明确要求优先，正文中的协调建议不得覆盖画风）：",
+    "strong": "内置画风（完整遵照并突出以下预设特征，以其主导画面语言；用户明确要求优先，正文中的协调建议不得覆盖画风）：",
+}
+IMAGE_AUTHORITY_LINE = (
+    "以用户图片中主体的实际外观为准，不要依据文字知识改写；除方案明确要求改动的部分外，其余保持原图。"
+)
+# 用户发参考图但要求画成别的场景时用这一句：主体照图，构图按方案。
+IMAGE_REFERENCE_LINE = (
+    "以用户图片中主体的实际外观为准，不要依据文字知识改写；场景、构图、姿势与镜头按上述方案重建，"
+    "不要保留原图的构图与背景。"
+)
+QUALITY_SECTION = ("全局审美与质量底线（仅在不与上述方案冲突时应用）：\n"
+                   + QUALITY_GUIDANCE.split("\n", 1)[1])
+QUALITY_HEAD = QUALITY_SECTION.split("\n", 1)[0]
+_LEGACY_STYLE_QUALITY_HEADS = (
+    "画风内的协调（不得覆盖用户明确要求或上述内置画风）：",
+    "画风内的协调与清洁度上限（不得覆盖用户明确要求或上述内置画风）：",
+)
+# 插件追加的内容固定在方案末尾，由标题行或整句引入，据此可以把它们整体切掉。
+# 只认插件自己写的这几个字符串：方案里出现"画面风格（"这类字样时不能被误切。
+_TAIL_HEADS = (*STYLE_LEADS.values(), *_LEGACY_STYLE_LEADS.values(), QUALITY_HEAD,
+               *_LEGACY_STYLE_QUALITY_HEADS, IMAGE_AUTHORITY_LINE, IMAGE_REFERENCE_LINE)
+_SECTION_RE = re.compile(rf"(?:\A|\n{{1,2}})(?={'|'.join(re.escape(head) for head in _TAIL_HEADS)})")
+
+
+def _normalize(text: str) -> str:
+    """统一换行符：插件自己追加的两段始终用 \n，不能让方案的 CRLF 影响切分。"""
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def plan_body(text: str) -> str:
+    """取回方案正文：去掉插件自己追加的风格段、图片约束句与兜底段。
+
+    兼容用户重新输入上一份完整提示词，交给文字模型前取回正文；``compose_prompt`` 开头也走一遍，重复拼装因此不会叠加。
+    """
+    return _SECTION_RE.split(_normalize(text), maxsplit=1)[0].rstrip()
+
+
+def compose_prompt(
+    plan: str,
+    *,
+    has_image: bool,
+    integrated: bool = False,
+    keep_layout: bool = True,
+) -> str:
+    """聊天稿已融合视觉要求；关键词原文仍追加既有质量段。
+
+    风格 ID 仅用于记录，不在提交阶段重新施加模板。
+    """
+    text = plan_body(plan)
+    if not text:
+        raise ValueError("绘图方案为空")
+
+    if has_image:
+        # keep_layout=False 是参考创作：主体照图，场景与构图按方案重建。
+        line = IMAGE_AUTHORITY_LINE if keep_layout else IMAGE_REFERENCE_LINE
+        if line not in text:
+            text += "\n\n" + line
+    if not integrated:
+        text += "\n\n" + QUALITY_SECTION
+    return text

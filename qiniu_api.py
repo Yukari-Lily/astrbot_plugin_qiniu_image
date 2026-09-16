@@ -6,6 +6,7 @@ import binascii
 import json
 import random
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,6 +39,14 @@ SUPPORTED_SIZES = (
     "3840x2160",
     "2160x3840",
 )
+
+
+@dataclass(frozen=True)
+class _ResponseImage:
+    """一次校验选定的图片；后续不再扫描原始响应。"""
+
+    b64_json: str = ""
+    url: str = ""
 
 
 class QiniuApiError(RuntimeError):
@@ -158,6 +167,14 @@ def _error_details(text: str) -> Tuple[Optional[str], str]:
     return None, _safe_excerpt(error) or "上游拒绝了请求"
 
 
+def _looks_like_multipart_mismatch(exc: "QiniuApiError") -> bool:
+    """判断错误是否为“该接口只收 multipart/form-data”。"""
+    if getattr(exc, "status", None) != 400:
+        return False
+    haystack = f"{getattr(exc, 'code', None) or ''} {exc}".lower()
+    return "multipart" in haystack
+
+
 def _looks_like_safety_error(code: Optional[str], message: str) -> bool:
     haystack = f"{code or ''} {message}".lower()
     markers = (
@@ -236,7 +253,7 @@ class QiniuImageClient:
         self.model = _config_choice(
             config,
             "model",
-            "openai/gpt-image-2.5-sunburst",
+            "openai/gpt-image-2",
             SUPPORTED_MODELS,
         )
 
@@ -283,7 +300,7 @@ class QiniuImageClient:
         async with self._semaphore:
             session = await self._get_session()
             data = await self._post_json_with_retry(session, GENERATIONS_PATH, self._base_payload(prompt))
-            return await self._images_from_response(session, data)
+            return await self._images_from_source(session, data)
 
     async def image_to_image(self, image: str, prompt: str) -> List[str]:
         """图生图（编辑），image 为 http(s) URL 或 base64:// 形式。"""
@@ -294,8 +311,14 @@ class QiniuImageClient:
 
         async with self._semaphore:
             session = await self._get_session()
-            data = await self._post_json_with_retry(session, EDITS_PATH, payload)
-            return await self._images_from_response(session, data)
+            try:
+                data = await self._post_json_with_retry(session, EDITS_PATH, payload)
+            except QiniuApiError as exc:
+                # 少数上游只接受 multipart/form-data；仅对该错误按文件部件重发一次。
+                if not _looks_like_multipart_mismatch(exc):
+                    raise
+                data = await self._post_multipart_with_retry(session, EDITS_PATH, payload, image)
+            return await self._images_from_source(session, data)
 
     def _base_payload(self, prompt: str) -> Dict[str, Any]:
         payload = {
@@ -333,15 +356,8 @@ class QiniuImageClient:
                 raise QiniuInputError(str(exc)) from None
         if image.startswith("base64://"):
             encoded = image[len("base64://"):]
-            try:
-                raw = self.decode_base64_image(encoded)
-            except ValueError as exc:
-                raise QiniuInputError(str(exc)) from None
-            mime = _image_mime(raw, allow_gif=True)
-            if not mime:
-                raise QiniuInputError("输入图片格式无效，仅支持 PNG、JPEG、WebP 或 GIF")
-            compact = re.sub(r"\s+", "", encoded)
-            return f"data:{mime};base64,{compact}"
+            mime = self._image_payload(encoded)[1]
+            return f"data:{mime};base64," + re.sub(r"\s+", "", encoded)
         raise QiniuInputError("未能识别输入图片（仅支持 URL 或 base64://）")
 
     async def _post_json_with_retry(
@@ -349,18 +365,83 @@ class QiniuImageClient:
         session: aiohttp.ClientSession,
         path: str,
         payload: Dict[str, Any],
-    ) -> Dict[str, Any]:
+    ) -> _ResponseImage:
+        def build(session: aiohttp.ClientSession, url: str, headers: Dict[str, str]):
+            return session.post(url, json=payload, headers={**headers, "Content-Type": "application/json"})
+
+        return await self._post_with_retry(session, path, build)
+
+    async def _post_multipart_with_retry(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        payload: Dict[str, Any],
+        image: str,
+    ) -> _ResponseImage:
+        """部分上游 /images/edits 只接受 multipart/form-data，需按文件部件重发。"""
+        raw, mime = await self._image_bytes(session, image)
+
+        def build(session: aiohttp.ClientSession, url: str, headers: Dict[str, str]):
+            form = aiohttp.FormData()
+            for key, value in self._multipart_fields(payload):
+                form.add_field(key, value)
+            extension = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}[mime]
+            form.add_field("image", raw, filename=f"image.{extension}", content_type=mime)
+            return session.post(url, data=form, headers=headers)
+
+        return await self._post_with_retry(session, path, build)
+
+    @staticmethod
+    def _multipart_fields(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+        return [(key, value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
+                for key, value in payload.items() if key != "images"]
+
+    def _image_payload(self, encoded: str) -> Tuple[bytes, str]:
+        """校验 base64 图片并返回 (原始字节, mime)；URL 与 base64 两种来源共用。"""
+        try:
+            raw = self.decode_base64_image(encoded)
+        except ValueError as exc:
+            raise QiniuInputError(str(exc)) from None
+        mime = _image_mime(raw, allow_gif=True)
+        if not mime:
+            raise QiniuInputError("输入图片格式无效，仅支持 PNG、JPEG、WebP 或 GIF")
+        return raw, mime
+
+    async def _image_bytes(self, session: aiohttp.ClientSession, image: str) -> Tuple[bytes, str]:
+        if image.startswith(("http://", "https://")):
+            try:
+                _validate_http_url(image, "输入图片 URL")
+            except ValueError as exc:
+                raise QiniuInputError(str(exc)) from None
+            raw = await self._download_bytes(
+                session, image, max_bytes=MAX_INPUT_IMAGE_BYTES, allow_gif=True,
+            )
+            mime = _image_mime(raw, allow_gif=True)
+            if not mime:
+                raise QiniuInputError("输入图片格式无效")
+            return raw, mime
+        elif image.startswith("base64://"):
+            encoded = image[len("base64://"):]
+        else:
+            raise QiniuInputError("未能识别输入图片（仅支持 URL 或 base64://）")
+        return self._image_payload(encoded)
+
+    async def _post_with_retry(
+        self,
+        session: aiohttp.ClientSession,
+        path: str,
+        build: Any,
+    ) -> _ResponseImage:
         url = f"{self.api_base}{path}"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
-            "Content-Type": "application/json",
         }
         attempts = self.retries
 
         for attempt in range(1, attempts + 1):
             try:
-                async with session.post(url, json=payload, headers=headers) as resp:
+                async with build(session, url, headers) as resp:
                     if resp.status // 100 == 2:
                         text = await resp.text()
                         code, message = None, ""
@@ -398,8 +479,7 @@ class QiniuImageClient:
                         raise QiniuResponseError("上游返回了无效 JSON") from None
                     if not isinstance(data, dict):
                         raise QiniuResponseError("上游响应必须是 JSON 对象")
-                    self._validate_image_response(data)
-                    return data
+                    return self._select_response_image(data)
 
             except (QiniuRateLimitError, QiniuTransientApiError) as exc:
                 if attempt < attempts:
@@ -411,8 +491,6 @@ class QiniuImageClient:
                     await asyncio.sleep(_backoff_seconds(attempt))
                     continue
                 raise
-            except QiniuApiError:
-                raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt < attempts:
                     await asyncio.sleep(_backoff_seconds(attempt))
@@ -423,9 +501,12 @@ class QiniuImageClient:
 
         raise QiniuRequestUncertainError("上游请求未完成")
 
-    async def _download_to_b64(self, session: aiohttp.ClientSession, url: str) -> str:
+    async def _download_bytes(
+        self, session: aiohttp.ClientSession, url: str,
+        *, max_bytes: int = MAX_OUTPUT_IMAGE_BYTES, allow_gif: bool = False,
+    ) -> bytes:
         try:
-            _validate_http_url(url, "响应图片 URL")
+            _validate_http_url(url, "图片 URL")
         except ValueError as exc:
             raise QiniuImageDownloadError(str(exc)) from None
 
@@ -444,7 +525,7 @@ class QiniuImageClient:
                     content_length = resp.headers.get("Content-Length")
                     if content_length:
                         try:
-                            if int(content_length) > MAX_OUTPUT_IMAGE_BYTES:
+                            if int(content_length) > max_bytes:
                                 raise QiniuImageDownloadError("响应图片超过大小限制")
                         except ValueError:
                             pass
@@ -458,21 +539,19 @@ class QiniuImageClient:
                     content = bytearray()
                     async for chunk in resp.content.iter_chunked(64 * 1024):
                         content.extend(chunk)
-                        if len(content) > MAX_OUTPUT_IMAGE_BYTES:
+                        if len(content) > max_bytes:
                             raise QiniuImageDownloadError("响应图片超过大小限制")
                     if not content:
                         raise QiniuImageDownloadError("响应图片为空")
                     raw_image = bytes(content)
-                    if not _image_mime(raw_image):
-                        raise QiniuImageDownloadError("响应内容不是支持的 PNG、JPEG 或 WebP 图片")
-                    return base64.b64encode(raw_image).decode("ascii")
+                    if not _image_mime(raw_image, allow_gif=allow_gif):
+                        raise QiniuImageDownloadError("下载内容不是支持的图片格式")
+                    return raw_image
 
             except _RetryableImageDownloadError as exc:
                 if attempt < self.retries:
                     await asyncio.sleep(_backoff_seconds(attempt, exc.retry_after))
                     continue
-                raise
-            except QiniuImageDownloadError:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt < self.retries:
@@ -499,8 +578,8 @@ class QiniuImageClient:
             raise QiniuResponseError("上游返回的 Base64 不是支持的 PNG、JPEG 或 WebP 图片")
         return re.sub(r"\s+", "", value)
 
-    def _validate_image_response(self, data: Dict[str, Any]) -> None:
-        """验证并规范图片响应；失败时由调用方按成功率优先策略重试。"""
+    def _select_response_image(self, data: Dict[str, Any]) -> _ResponseImage:
+        """校验并选取第一份可用图片，跳过无效条目，返回独立结果。"""
         items = data.get("data")
         if not isinstance(items, list) or not items:
             raise QiniuResponseError("生成成功但响应中没有图片数据")
@@ -512,15 +591,13 @@ class QiniuImageClient:
             inline = item.get("b64_json")
             if isinstance(inline, str) and inline:
                 try:
-                    item["b64_json"] = self._normalize_response_base64(inline)
-                    return
+                    return _ResponseImage(b64_json=self._normalize_response_base64(inline))
                 except QiniuResponseError as exc:
                     last_error = exc
             url = item.get("url")
             if isinstance(url, str) and url:
                 try:
-                    _validate_http_url(url, "响应图片 URL")
-                    return
+                    return _ResponseImage(url=_validate_http_url(url, "响应图片 URL"))
                 except ValueError as exc:
                     last_error = QiniuResponseError(str(exc))
 
@@ -528,23 +605,12 @@ class QiniuImageClient:
             raise last_error
         raise QiniuResponseError("生成成功但响应中没有可用的 b64_json 或 URL")
 
-    async def _images_from_response(
+    async def _images_from_source(
         self,
         session: aiohttp.ClientSession,
-        data: Dict[str, Any],
+        source: _ResponseImage,
     ) -> List[str]:
-        items = data.get("data")
-        if not isinstance(items, list) or not items:
-            raise QiniuResponseError("生成成功但响应中没有图片数据")
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            inline = item.get("b64_json")
-            if isinstance(inline, str) and inline:
-                return [self._normalize_response_base64(inline)]
-            url = item.get("url")
-            if isinstance(url, str) and url:
-                return [await self._download_to_b64(session, url)]
-
-        raise QiniuResponseError("生成成功但响应中没有可用的 b64_json 或 URL")
+        if source.b64_json:
+            return [source.b64_json]
+        raw = await self._download_bytes(session, source.url)
+        return [base64.b64encode(raw).decode("ascii")]

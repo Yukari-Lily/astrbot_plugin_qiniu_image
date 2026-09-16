@@ -11,16 +11,16 @@
     "description": "图像模型",
     "hint": "需同时支持文生图和改图。",
     "type": "string",
-    "default": "openai/gpt-image-2.5-sunburst",
+    "default": "openai/gpt-image-2",
     "options": [
+      "openai/gpt-image-2",
       "openai/gpt-image-2.5-sunburst",
-      "openai/gpt-image-2.5-flare",
-      "openai/gpt-image-2"
+      "openai/gpt-image-2.5-flare"
     ]
   },
   "rewrite_provider_ids": {
-    "description": "提示词优化模型",
-    "hint": "第一项为主模型，后续按顺序回退；留空则使用当前会话模型。",
+    "description": "优化与安全改写模型",
+    "hint": "聊天出图时整理主模型的完整方案，融合适用画风与质量要求；也用于安全改写。每轮按列表顺序尝试模型，失败先切备用，每模型最多3次；正常优化每次最多120秒，安全改写45秒。留空跟随会话，全部失败停止出图。",
     "type": "list",
     "default": [],
     "items": {
@@ -33,7 +33,12 @@
     "hint": "auto 由模型自动决定；更高质量通常耗时更长。",
     "type": "string",
     "default": "auto",
-    "options": ["low", "medium", "high", "auto"]
+    "options": [
+      "low",
+      "medium",
+      "high",
+      "auto"
+    ]
   },
   "size": {
     "description": "尺寸 size",
@@ -56,7 +61,10 @@
     "hint": "low=较宽松；auto=上游默认。公开场景建议 auto。",
     "type": "string",
     "default": "low",
-    "options": ["low", "auto"]
+    "options": [
+      "low",
+      "auto"
+    ]
   },
   "concurrency": {
     "description": "最大并发出图数",
@@ -64,23 +72,26 @@
     "type": "int",
     "default": 3
   },
-  "style_mode": {
+  "enable_styles": {
     "description": "内置风格",
-    "hint": "auto=自动匹配；explicit_only=仅明确点名；disabled=关闭。",
-    "type": "string",
-    "default": "auto",
-    "options": ["auto", "explicit_only", "disabled"]
+    "hint": "开启后，方案未确定具体画风时自动匹配相容项，由优化模型融合适用特征；已有具体视觉方案或外部画风时不强套模板。净色为低优先，仅限有依据的至少两名人物。局部改图默认沿用原图。关键词直出不自动选风格。",
+    "type": "bool",
+    "default": true
   },
   "style_strength": {
     "description": "风格强度",
-    "hint": "normal=标准；subtle=轻微；strong=强烈。",
+    "hint": "优化时的风格融合强度：subtle只借用少量特征；normal采用核心语言并删除冲突细节；strong充分使用相容的构图、色彩和材质。聊天出图不再机械追加预设和质量段，用户要求与既定方案优先。",
     "type": "string",
     "default": "normal",
-    "options": ["normal", "subtle", "strong"]
+    "options": [
+      "normal",
+      "subtle",
+      "strong"
+    ]
   },
   "triggers": {
     "description": "直接出图触发词",
-    "hint": "可选；命中后绕过主聊天模型，适合输入完整提示词。不要填写 Bot 唤醒词。",
+    "hint": "可选；命中后绕过主聊天模型和正常优化，使用用户原文，只追加图片约束和全局质量底线，不追加内置风格。审核拒绝时仍会安全改写。不要填写 Bot 唤醒词。",
     "type": "list",
     "default": [],
     "items": {
