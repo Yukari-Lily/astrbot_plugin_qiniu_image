@@ -1,6 +1,6 @@
 name: astrbot_plugin_qiniu_image
-display_name: Modelink AI 绘图
-desc: Modelink AI 绘图
+display_name: Modelink AI 绘图与 Grok 视频
+desc: Modelink 绘图 / 改图，支持 Grok 图片兜底与视频生成
 author: Yukari Lily
-version: "2.0.0"
+version: "2.1.0"
 repo: https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image

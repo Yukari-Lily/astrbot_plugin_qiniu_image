@@ -1,10 +1,12 @@
-"""七牛 AI 绘图 / 改图插件。"""
+"""七牛 AI 绘图 / 改图与 Grok 视频插件。"""
 
 import asyncio
 import json
+import tempfile
 import time
 import traceback
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Coroutine, Dict, List, Optional, Set, Tuple
 
 import astrbot.api.message_components as Comp
@@ -13,6 +15,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
 
 from .drawing_plan import DrawingRequest, ImagePlan, ImageRecord
+from .grok_api import GrokClient, GrokVideoError, VIDEO_MODEL
 from .message_utils import resolve_input_image
 from .prompt_optimizer import optimize_prompt
 from .qiniu_api import (
@@ -44,14 +47,15 @@ _NOT_CONFIGURED = "生成失败喵（未配置 api_key）"
 @register(
     "astrbot_plugin_qiniu_image",
     "Yukari Lily",
-    "七牛 AI 绘图 / 改图",
-    "2.0.0",
+    "七牛 AI 绘图 / 改图与 Grok 视频",
+    "2.1.0",
     "https://github.com/Yukari-Lily/astrbot_plugin_qiniu_image",
 )
 class QiniuImagePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.client = QiniuImageClient(config)
+        self.grok_client = GrokClient(config)
 
         raw_triggers = config.get("triggers") or []
         if not isinstance(raw_triggers, (list, tuple)):
@@ -94,6 +98,7 @@ class QiniuImagePlugin(Star):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.client.close()
+        await self.grok_client.close()
 
     def _start_task(self, coroutine: Coroutine[Any, Any, Any]) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
@@ -138,6 +143,10 @@ class QiniuImagePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def on_message(self, event: AstrMessageEvent):
+        # 保留独立的视频指令，避免被“生”等较短出图触发词抢先处理。
+        command = (event.message_str or "").strip().lstrip("/").split(maxsplit=1)
+        if command and command[0] == "生视频":
+            return
         trigger = self._match_trigger(event)
         if trigger is None:
             return
@@ -217,6 +226,111 @@ class QiniuImagePlugin(Star):
             "已受理，出图完成后插件会自动发送图片，请勿重复调用。现在只用一条消息复述用户想画什么，"
             "不要补充尚未决定的画面细节。本轮到此为止，不要再发进度、确认或第二条消息。"
         )
+
+    @filter.command("生视频")
+    async def video_command(self, event: AstrMessageEvent, prompt: str = ""):
+        """/生视频 描述：默认生成 8 秒、16:9、720p 视频。"""
+        event.stop_event()
+        if self._dedup_hit(event):
+            return
+        # 从整条消息取参数，保留带空格的完整提示词。
+        text = (event.message_str or "").strip().lstrip("/")
+        command = text.split(maxsplit=1)
+        if command and command[0] == "生视频":
+            prompt = command[1] if len(command) > 1 else ""
+        error = self._video_request_error(prompt, 8, "16:9", "720p")
+        if error:
+            yield event.plain_result(error)
+            return
+        self._start_task(self._video_and_push(event, prompt.strip(), 8, "16:9", "720p"))
+        yield event.plain_result("已受理，视频生成完成后会自动发送喵。")
+
+    @filter.llm_tool(name="generate_video")
+    async def generate_video(
+        self, event: AstrMessageEvent, prompt: str,
+        duration: int = 8, aspect_ratio: str = "16:9", resolution: str = "720p",
+    ):
+        """用户明确要求生成视频时调用，用 Grok 生成视频并自动发送。
+
+        根据用户要求组织主体、动作、场景和镜头运动，不调用图片优化器。
+        当前消息或引用中的第一张图片自动作为视频首帧，没有图片则文生视频。
+        此工具不会读取上一张图片的像素；要让已有图片动起来，请用户发送或引用图片。
+        同一请求只调用一次，受理后仅简短确认，等待插件自动发送，不要重复提交。
+
+        Args:
+            prompt(string): 完整的视频描述；有首帧图片时描述动作和镜头变化。
+            duration(int): 视频时长，1～15 秒，默认 8 秒。
+            aspect_ratio(string): 宽高比，1:1、2:3、3:2、9:16 或 16:9，默认 16:9。
+            resolution(string): 分辨率，480p 或 720p，默认 720p。
+        """
+        error = self._video_request_error(prompt, duration, aspect_ratio, resolution)
+        if error:
+            return error
+        self._start_task(self._video_and_push(event, prompt.strip(), duration, aspect_ratio, resolution))
+        return "已受理，插件会自动发送视频。请勿重复调用，只需简短确认，不再发送进度消息。"
+
+    def _video_request_error(
+        self, prompt: str, duration: int, aspect_ratio: str, resolution: str,
+    ) -> Optional[str]:
+        if not self.grok_client.configured:
+            return "生成视频失败喵（请先配置 grok2api_base_url 和所需的 grok2api_api_key）"
+        if not isinstance(prompt, str) or not prompt.strip():
+            return "请提供视频描述，例如：/生视频 纸飞机飞过城市，镜头跟随。"
+        try:
+            self.grok_client.validate_video_options(duration, aspect_ratio, resolution)
+        except ValueError as exc:
+            return f"生成视频失败喵（{exc}）"
+        return None
+
+    async def _video_and_push(
+        self, event: AstrMessageEvent, prompt: str,
+        duration: int, aspect_ratio: str, resolution: str,
+    ) -> None:
+        video_path: Optional[Path] = None
+        try:
+            try:
+                image_ref = await self._load_input_image(event)
+                logger.info(
+                    f"grok-video submit | {self._ctx(event)} model={VIDEO_MODEL} "
+                    f"duration={duration} aspect_ratio={aspect_ratio} resolution={resolution} "
+                    f"has_image={bool(image_ref)}"
+                )
+                url = await self.grok_client.generate_video(
+                    prompt, image_ref, duration, aspect_ratio, resolution,
+                )
+                with tempfile.NamedTemporaryFile(prefix="grok-video-", suffix=".mp4", delete=False) as file:
+                    video_path = Path(file.name)
+                await self.grok_client.download_video(url, video_path)
+                chain = MessageChain([Comp.Video.fromFileSystem(str(video_path))])
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"grok-video failed | {self._ctx(event)} error_type={type(exc).__name__}")
+                if isinstance(exc, asyncio.TimeoutError):
+                    detail = "请求或下载超时；上游任务可能仍在执行"
+                elif isinstance(exc, QiniuAuthError):
+                    detail = "grok2api 密钥无效或没有模型权限"
+                elif isinstance(exc, QiniuSafetyError):
+                    detail = "上游审核拒绝了视频请求"
+                elif isinstance(exc, QiniuRateLimitError):
+                    detail = "grok2api 服务繁忙，请稍后再试"
+                elif isinstance(exc, (ValueError, GrokVideoError)):
+                    detail = str(exc)
+                else:
+                    detail = "grok2api 请求失败或响应异常，请查看上游服务状态"
+                chain = MessageChain().message(f"生成视频失败喵（{detail}）")
+            if await self.context.send_message(event.unified_msg_origin, chain) is False:
+                raise RuntimeError("消息平台未接受发送")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"grok-video: 推送结果失败 | {self._ctx(event)}（{type(exc).__name__}）")
+        finally:
+            if video_path is not None:
+                try:
+                    video_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("grok-video: 无法清理临时视频文件")
 
     @filter.llm_tool(name="get_last_image_prompt")
     async def get_last_image_prompt(self, event: AstrMessageEvent):
@@ -305,7 +419,15 @@ class QiniuImagePlugin(Star):
             plan.prompt, has_image=bool(image_ref), integrated=plan.integrated,
             keep_layout=keep_layout,
         )
+        first_rewrite: Optional[ImagePlan] = None
         for safety_attempt in range(SAFETY_REWRITE_LEVELS + 1):
+            if safety_attempt == 2:
+                # Grok 先用首次提交稿，再用第一层改写稿；都失败才继续原模型第二层。
+                fallback = await self._try_grok_fallback(
+                    event, plan, first_rewrite, image_ref, keep_layout,
+                )
+                if fallback:
+                    return fallback, None
             candidate = plan
             if safety_attempt:
                 rewritten = await rewrite_for_safety(
@@ -322,6 +444,8 @@ class QiniuImagePlugin(Star):
                 candidate.prompt, has_image=bool(image_ref), integrated=candidate.integrated,
                 keep_layout=keep_layout,
             )
+            if safety_attempt == 1:
+                first_rewrite = candidate
             logger.info(
                 f"qiniu-image submit | {self._ctx(event)} style={candidate.style or '无'} "
                 f"integrated={candidate.integrated} exception={candidate.style_exception or '无'} "
@@ -344,8 +468,66 @@ class QiniuImagePlugin(Star):
                 continue
             if result[0]:
                 self._remember_image_prompt(event, candidate, bool(image_ref), keep_layout, final_prompt)
+            elif safety_attempt == 1 and self.grok_client.configured:
+                # 第一层非审核错误也进入 Grok；未配置时保留原错误处理。
+                continue
             return result
         return None, "生成失败喵（所有安全级别均未能生成可用图片）"
+
+    async def _try_grok_fallback(
+        self, event: AstrMessageEvent, plan: ImagePlan,
+        first_rewrite: Optional[ImagePlan], image_ref: Optional[str], keep_layout: bool,
+    ) -> Optional[str]:
+        if not self.grok_client.configured:
+            return None
+        original_prompt = compose_prompt(
+            plan.prompt, has_image=bool(image_ref), integrated=plan.integrated,
+            keep_layout=keep_layout,
+        )
+        for safety_attempt in (0, 1):
+            candidate = plan
+            if safety_attempt:
+                if first_rewrite is None:
+                    # 原模型第一层没得到可用改写时，Grok 原词失败后再请求第一层改写。
+                    rewritten = await rewrite_for_safety(
+                        self.context, event.unified_msg_origin,
+                        original_prompt if plan.integrated else plan.prompt,
+                        provider_id=self.rewrite_provider_id,
+                        fallback_provider_ids=self.rewrite_fallback_provider_ids,
+                        safety_attempt=1,
+                    )
+                    if rewritten is None:
+                        break
+                    first_rewrite = replace(plan, prompt=rewritten)
+                candidate = first_rewrite
+            final_prompt = original_prompt if not safety_attempt else compose_prompt(
+                candidate.prompt, has_image=bool(image_ref), integrated=candidate.integrated,
+                keep_layout=keep_layout,
+            )
+            logger.info(
+                f"grok-image fallback | {self._ctx(event)} model={self.grok_client.model} "
+                f"has_image={bool(image_ref)} safety_attempt={safety_attempt}"
+            )
+            logger.debug(
+                f"grok-image submit | {self._ctx(event)} safety_attempt={safety_attempt} "
+                f"prompt={final_prompt!r}"
+            )
+            try:
+                image = await self.grok_client.generate_image(final_prompt, image_ref)
+                if not image:
+                    raise QiniuResponseError("grok2api 没有返回图片")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"grok-image fallback failed | {self._ctx(event)} safety_attempt={safety_attempt} "
+                    f"error_type={type(exc).__name__}"
+                )
+                continue
+            self._remember_image_prompt(event, candidate, bool(image_ref), keep_layout, final_prompt)
+            return image
+        logger.warning(f"grok-image fallback exhausted | {self._ctx(event)}; resume safety level 2")
+        return None
 
     def _remember_image_prompt(
         self, event: AstrMessageEvent, plan: ImagePlan, has_image: bool, keep_layout: bool,

@@ -504,6 +504,7 @@ class QiniuImageClient:
     async def _download_bytes(
         self, session: aiohttp.ClientSession, url: str,
         *, max_bytes: int = MAX_OUTPUT_IMAGE_BYTES, allow_gif: bool = False,
+        headers: Optional[Dict[str, str]] = None,
     ) -> bytes:
         try:
             _validate_http_url(url, "图片 URL")
@@ -512,7 +513,7 @@ class QiniuImageClient:
 
         for attempt in range(1, self.retries + 1):
             try:
-                async with session.get(url) as resp:
+                async with session.get(url, **({"headers": headers} if headers else {})) as resp:
                     if resp.status == 429 or 500 <= resp.status < 600:
                         retry_after = _retry_after_seconds(resp.headers) if resp.status == 429 else None
                         raise _RetryableImageDownloadError(

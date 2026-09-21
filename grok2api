@@ -1,0 +1,303 @@
+Image generations
+Grok Web 图片生成，支持 n、宽高比、1k/2k、URL、Base64 和扩展流式输出。
+
+POST
+/v1/images/generations
+
+接入信息
+Base URL
+http://127.0.0.1:8000/v1
+
+鉴权 Header
+Authorization: Bearer g2a_...
+
+请求参数
+参数
+说明
+model*
+模型页中已启用且当前存在可用账号支持的对外模型名称。
+prompt*
+用于生成或编辑图片的自然语言描述。
+n
+需要返回的图片数量；Web 会原样映射为上游 num_generations。
+aspect_ratio
+输出媒体的宽高比，例如 1:1、2:3 或 16:9。
+resolution
+Console 图片支持 1k/2k；Web 图片生成忽略 resolution/quality，并由模型名称选择上游产品。
+quality
+Console Image 2.0 的生成质量，可选 low 或 medium；默认 medium。Web 图片生成路由忽略该字段。
+response_format
+图片返回格式，支持 url 或 b64_json。
+stream
+是否使用图片生成扩展 SSE 流；默认 false。
+调用示例
+请求
+响应
+
+cURL
+
+grok-imagine-image-2.0
+
+export GROK2API_API_KEY="g2a_your_api_key"
+
+curl -X POST "http://127.0.0.1:8000/v1/images/generations" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "model": "grok-imagine-image-2.0",
+  "prompt": "A minimal red chair in a bright studio",
+  "n": 1,
+  "response_format": "url"
+}'
+实现说明
+客户端通过 n 指定图片数量；Web 将其原样映射为上游 num_generations。
+生成结果统一归档到媒体存储；url 返回网关资源地址，b64_json 返回编码后的图片内容。
+
+
+
+Image edits
+Grok Web 图片编辑，使用官方 JSON 图片 URL 协议。
+
+POST
+/v1/images/edits
+
+接入信息
+Base URL
+http://127.0.0.1:8000/v1
+
+鉴权 Header
+Authorization: Bearer g2a_...
+
+请求参数
+参数
+说明
+model*
+模型页中已启用且当前存在可用账号支持的对外模型名称。
+prompt*
+用于生成或编辑图片的自然语言描述。
+image / images*
+待编辑图片，使用 image 或 images 传入 URL、Data URL 或已支持的图片引用。
+n
+需要返回的图片数量；Web 会原样映射为上游 num_generations。
+quality
+Console Image 2.0 的生成质量，可选 low 或 medium；默认 medium。Web 图片生成路由忽略该字段。
+response_format
+图片返回格式，支持 url 或 b64_json。
+调用示例
+请求
+响应
+
+cURL
+
+grok-imagine-image-2.0
+
+export GROK2API_API_KEY="g2a_your_api_key"
+
+curl -X POST "http://127.0.0.1:8000/v1/images/edits" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "model": "grok-imagine-image-2.0",
+  "prompt": "Change the chair to black",
+  "image": {
+    "url": "https://example.com/chair.png"
+  },
+  "n": 1,
+  "response_format": "url"
+}'
+实现说明
+图片编辑采用 JSON 请求体，不提供 multipart 兼容层。
+远程图片会经过 SSRF、防体积超限和内容类型校验后再上传到上游。
+生成结果统一归档到媒体存储；url 返回网关资源地址，b64_json 返回编码后的图片内容。
+
+
+Video generations
+按 xAI 官方协议创建异步视频生成任务并返回 request_id。
+
+POST
+/v1/videos/generations
+
+接入信息
+Base URL
+http://127.0.0.1:8000/v1
+
+鉴权 Header
+Authorization: Bearer g2a_...
+
+请求参数
+参数
+说明
+model*
+模型页中已启用且当前存在可用账号支持的对外模型名称。
+prompt
+视频描述；使用图片输入时可作为运动或镜头指令。
+duration
+视频时长（秒），范围 1–15。Console 路由中，grok-imagine-video 的参考图模式最长 10 秒；grok-imagine-video-1.5 最长 15 秒。
+aspect_ratio
+输出媒体的宽高比，例如 1:1、2:3 或 16:9。
+resolution
+视频输出分辨率，支持 480p/720p；仅上游模型 grok-imagine-video-1.5 在非参考图模式下支持 1080p。
+image
+可选首帧图片引用，用于图生视频；最多 1 张，不可与 reference_images 同时使用。
+reference_images
+可选参考图片数组，用于参考图视频；网关最多接收 8 张，Console 路由最多 7 张。每项提供 url 或 file_id，不可与 image 同时使用。
+reference_audios
+可选参考音频数组，最多 3 个内置 voice_id；可单独使用或与 reference_images 组合。该能力可能受上游团队权限控制；Console 未开通时上游返回 403。
+调用示例
+请求
+响应
+
+cURL
+
+grok-imagine-video
+
+export GROK2API_API_KEY="g2a_your_api_key"
+
+curl -X POST "http://127.0.0.1:8000/v1/videos/generations" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "model": "grok-imagine-video",
+  "prompt": "A paper airplane flying over a city",
+  "duration": 8,
+  "aspect_ratio": "16:9",
+  "resolution": "720p"
+}'
+实现说明
+创建接口只返回 request_id；生成过程异步执行并持久化任务状态。
+参考图视频走 /videos/generations + reference_images；只传 1 张也保持参考图语义，不会被当成首帧。网关最多接收 8 张，Console 路由最多 7 张；不可与 image 同用。参考图模式最高 720p。Console 的 grok-imagine-video 参考图模式最长 10 秒，reference_audios 还需相应团队权限。
+视频接口严格使用当前官方字段，不保留旧项目的兼容别名。
+
+Video edits
+按 xAI 官方协议编辑已有视频，并返回 request_id。
+
+POST
+/v1/videos/edits
+
+接入信息
+Base URL
+http://127.0.0.1:8000/v1
+
+鉴权 Header
+Authorization: Bearer g2a_...
+
+请求参数
+参数
+说明
+model*
+模型页中已启用且当前存在可用账号支持的对外模型名称。
+prompt*
+描述希望如何修改原视频。
+video*
+输入视频，支持 url 或本地上传后的 file_id。
+调用示例
+请求
+响应
+
+cURL
+
+grok-imagine-video
+
+export GROK2API_API_KEY="g2a_your_api_key"
+
+curl -X POST "http://127.0.0.1:8000/v1/videos/edits" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "model": "grok-imagine-video",
+  "prompt": "Give the woman a silver necklace",
+  "video": {
+    "url": "https://example.com/source.mp4"
+  }
+}'
+实现说明
+创建接口只返回 request_id；生成过程异步执行并持久化任务状态。
+视频编辑与延长的实际路由必须指向 Console/grok-imagine-video；对外模型名可以自定义。
+视频编辑与延长暂未返回可可靠结算的输入视频时长，因此保持可调用，并在请求审计中标记为未计费；不会消耗 API Key 的金额额度。
+视频接口严格使用当前官方字段，不保留旧项目的兼容别名。
+
+Video extensions
+按 xAI 官方协议延长已有视频，并返回 request_id。
+
+POST
+/v1/videos/extensions
+
+接入信息
+Base URL
+http://127.0.0.1:8000/v1
+
+鉴权 Header
+Authorization: Bearer g2a_...
+
+请求参数
+参数
+说明
+model*
+模型页中已启用且当前存在可用账号支持的对外模型名称。
+prompt*
+描述视频接下来应发生的内容。
+video*
+输入视频，支持 url 或本地上传后的 file_id。
+duration
+延长片段时长，单位秒，范围 2 到 10，默认 6。
+调用示例
+请求
+响应
+
+cURL
+
+grok-imagine-video
+
+export GROK2API_API_KEY="g2a_your_api_key"
+
+curl -X POST "http://127.0.0.1:8000/v1/videos/extensions" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+  "model": "grok-imagine-video",
+  "prompt": "The shot pans to an over the shoulder perspective.",
+  "duration": 6,
+  "video": {
+    "url": "https://example.com/source.mp4"
+  }
+}'
+实现说明
+创建接口只返回 request_id；生成过程异步执行并持久化任务状态。
+视频编辑与延长的实际路由必须指向 Console/grok-imagine-video；对外模型名可以自定义。
+视频编辑与延长暂未返回可可靠结算的输入视频时长，因此保持可调用，并在请求审计中标记为未计费；不会消耗 API Key 的金额额度。
+视频接口严格使用当前官方字段，不保留旧项目的兼容别名。
+
+    Get video
+按 request_id 查询 pending、done 或 failed 状态及生成结果。
+
+GET
+/v1/videos/{request_id}
+
+接入信息
+Base URL
+http://127.0.0.1:8000/v1
+
+鉴权 Header
+Authorization: Bearer g2a_...
+
+路径参数
+参数
+说明
+request_id*
+创建视频任务时返回的 request_id。
+调用示例
+请求
+响应
+
+cURL
+
+grok-imagine-video
+
+export GROK2API_API_KEY="g2a_your_api_key"
+
+curl -X GET "http://127.0.0.1:8000/v1/videos/video_example" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -H "Content-Type: application/json"
+实现说明
+使用创建接口返回的 request_id 轮询任务状态。
+响应状态为 pending、done 或 failed；完成后 video 中包含结果信息。
