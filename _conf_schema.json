@@ -102,6 +102,12 @@
     "default": "",
     "secret": true
   },
+  "grok2api_image_model": {
+    "description": "Grok 图像模型",
+    "hint": "图片兜底使用的模型名，默认 grok-imagine-image-2.0；需在上游 grok2api 启用该模型。文生图与带原图改图都用它，不能为空。",
+    "type": "string",
+    "default": "grok-imagine-image-2.0"
+  },
   "grok2api_concurrency": {
     "description": "Grok 最大并发任务数",
     "hint": "图片兜底与视频生成共用的并发上限，必须为正整数；超出后排队。",

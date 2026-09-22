@@ -10,6 +10,8 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import aiohttp
 
+from astrbot.api import logger
+
 from .qiniu_api import (
     QiniuApiError,
     QiniuAuthError,
@@ -19,6 +21,7 @@ from .qiniu_api import (
     QiniuResponseError,
     QiniuSafetyError,
     QiniuTransientApiError,
+    _backoff_seconds,
     _config_positive_int,
     _config_string,
     _error_details,
@@ -28,6 +31,7 @@ from .qiniu_api import (
 
 IMAGE_MODEL = "grok-imagine-image-2.0"
 VIDEO_MODEL = "grok-imagine-video"
+IMAGE_SUBMIT_ATTEMPTS = 3
 MAX_VIDEO_BYTES = 200 * 1024 * 1024
 VIDEO_ASPECT_RATIOS = ("1:1", "2:3", "3:2", "9:16", "16:9")
 
@@ -53,7 +57,7 @@ class GrokClient(QiniuImageClient):
             if not base.endswith("/v1"):
                 base += "/v1"
         self.api_base = base
-        self.model = IMAGE_MODEL
+        self.model = _config_string(config, "grok2api_image_model", IMAGE_MODEL)
         self.video_timeout = _config_positive_int(config, "grok2api_video_timeout", 600)
         self.retries = 2  # 仅用于已生成图片的下载，不重新提交生成请求。
         size = str(config.get("size", "auto") or "auto")
@@ -123,9 +127,37 @@ class GrokClient(QiniuImageClient):
                 raise error_type(response.status, message, code)
             return data
 
+    async def _submit_image(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """提交 Grok 图片请求；连接中断、限流和 5xx 按退避重试同一份稿件。
+
+        这些故障与提示词内容无关，重试同一份稿件比换成改写稿更可能成功，也避免白白花掉
+        一次安全改写。鉴权、审核拒绝和输入错误不重试。POST 可能已被上游受理，重试因此
+        有重复出图的代价，只做有限次数。
+        """
+        for attempt in range(1, IMAGE_SUBMIT_ATTEMPTS + 1):
+            error_name, delay = "", 0.0
+            try:
+                return await self._request_json("POST", path, payload)
+            except (QiniuRateLimitError, QiniuTransientApiError) as exc:
+                if attempt >= IMAGE_SUBMIT_ATTEMPTS:
+                    raise
+                error_name = type(exc).__name__
+                delay = _backoff_seconds(attempt, exc.retry_after)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= IMAGE_SUBMIT_ATTEMPTS:
+                    raise
+                error_name = type(exc).__name__
+                delay = _backoff_seconds(attempt)
+            logger.warning(
+                f"grok-image retry | path={path} attempt={attempt}/{IMAGE_SUBMIT_ATTEMPTS} "
+                f"error_type={error_name} wait={delay:.1f}s"
+            )
+            await asyncio.sleep(delay)
+        raise QiniuResponseError("grok2api 图片请求未完成")
+
     async def generate_image(self, prompt: str, image: Optional[str] = None) -> str:
         payload: Dict[str, Any] = {
-            "model": IMAGE_MODEL, "prompt": prompt, "n": 1,
+            "model": self.model, "prompt": prompt, "n": 1,
             "response_format": "b64_json",
         }
         path = "/images/generations"
@@ -135,7 +167,7 @@ class GrokClient(QiniuImageClient):
         elif self.image_aspect_ratio:
             payload["aspect_ratio"] = self.image_aspect_ratio
         async with self._semaphore:
-            data = await self._request_json("POST", path, payload)
+            data = await self._submit_image(path, payload)
             items = data.get("data")
             if isinstance(items, list):
                 for item in items:

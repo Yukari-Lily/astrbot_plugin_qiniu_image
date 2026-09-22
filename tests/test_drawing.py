@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import aiohttp
+
 
 ROOT = Path(__file__).resolve().parents[1]
 package = types.ModuleType("drawing_plugin")
@@ -71,6 +73,7 @@ main = importlib.import_module("drawing_plugin.main")
 plans = importlib.import_module("drawing_plugin.drawing_plan")
 optimizer = importlib.import_module("drawing_plugin.prompt_optimizer")
 qiniu = importlib.import_module("drawing_plugin.qiniu_api")
+grok = importlib.import_module("drawing_plugin.grok_api")
 styles = importlib.import_module("drawing_plugin.style_presets")
 utils = importlib.import_module("drawing_plugin.message_utils")
 
@@ -432,6 +435,20 @@ class PromptTests(unittest.TestCase):
 
 
 class SafetyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_refusal_after_a_soft_opening_is_still_rejected(self):
+        # 线上实际漏判：首句以"无法按……"开头，拒答词表只认"我无法"，且只扫首句。
+        safety = importlib.import_module("drawing_plugin.safety_rewriter")
+        logged = (
+            "无法按你的要求改写或输出该提示词。\n\n"
+            "我不能协助编写或改写成仍在描绘裸露胸部、或用于绕过图像平台审核的提示。\n\n"
+            "若你需要全年龄向的二次元角色插画提示（不涉及裸露），可以说明角色、服装和构图，"
+            "我可以帮你写一版干净可用的提示词。"
+        )
+        self.assertFalse(safety.is_prompt_text(logged))
+        self.assertIsNone(safety._parse_rewrite(logged))
+        # 先客套一句再拒答的写法同样要拦住。
+        self.assertFalse(safety.is_prompt_text("好的，我理解了。我不能协助编写这样的提示词。"))
+
     async def test_refusal_is_rejected_but_normal_prose_is_kept(self):
         safety = importlib.import_module("drawing_plugin.safety_rewriter")
         self.assertFalse(safety.is_prompt_text("抱歉，我无法改写"))
@@ -460,6 +477,81 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("做最大安全改写", fifth_task)
         self.assertIn("衣着完整", fifth_system)
         self.assertIn("至少弱化其中一项", fifth_system)
+
+
+class GrokClientConfigTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def build(**overrides):
+        config = {"grok2api_base_url": "http://127.0.0.1:9/v1", "grok2api_api_key": "k"}
+        config.update(overrides)
+        return grok.GrokClient(config)
+
+    def test_image_model_defaults_and_can_be_overridden(self):
+        self.assertEqual(self.build().model, "grok-imagine-image-2.0")
+        self.assertEqual(
+            self.build(grok2api_image_model="grok-imagine-image-3.0").model,
+            "grok-imagine-image-3.0",
+        )
+
+    def test_empty_image_model_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.build(grok2api_image_model="  ")
+
+    async def test_transient_disconnect_retries_same_prompt_before_giving_up(self):
+        client = self.build()
+        submitted = []
+
+        async def fake_request(method, path, payload=None):
+            submitted.append(payload["prompt"])
+            if len(submitted) < 3:
+                raise aiohttp.ServerDisconnectedError("connection closed")
+            return {"data": [{"b64_json": PNG_B64}]}
+
+        with patch.object(client, "_request_json", side_effect=fake_request), \
+             patch.object(grok, "_backoff_seconds", return_value=0.0):
+            image = await client.generate_image("一只猫")
+
+        # 同一份稿件重试，不换提示词。
+        self.assertEqual(submitted, ["一只猫"] * 3)
+        self.assertTrue(image)
+
+    async def test_persistent_disconnect_stops_after_bounded_attempts(self):
+        client = self.build()
+        request = AsyncMock(side_effect=aiohttp.ServerDisconnectedError("connection closed"))
+
+        with patch.object(client, "_request_json", request), \
+             patch.object(grok, "_backoff_seconds", return_value=0.0):
+            with self.assertRaises(aiohttp.ServerDisconnectedError):
+                await client.generate_image("一只猫")
+
+        self.assertEqual(request.await_count, grok.IMAGE_SUBMIT_ATTEMPTS)
+
+    async def test_auth_and_safety_errors_are_not_retried(self):
+        client = self.build()
+
+        for error in (qiniu.QiniuAuthError(401, "bad key"), qiniu.QiniuSafetyError(400, "safety")):
+            with self.subTest(error=type(error).__name__):
+                request = AsyncMock(side_effect=error)
+                with patch.object(client, "_request_json", request), \
+                     patch.object(grok, "_backoff_seconds", return_value=0.0):
+                    with self.assertRaises(type(error)):
+                        await client.generate_image("一只猫")
+                self.assertEqual(request.await_count, 1)
+
+    async def test_configured_image_model_is_sent_upstream(self):
+        client = self.build(grok2api_image_model="grok-imagine-image-3.0")
+        payloads = []
+
+        async def fake_request(method, path, payload=None):
+            payloads.append((method, path, payload))
+            return {"data": [{"b64_json": PNG_B64}]}
+
+        with patch.object(client, "_request_json", side_effect=fake_request):
+            image = await client.generate_image("一只猫")
+
+        self.assertEqual(payloads[0][1], "/images/generations")
+        self.assertEqual(payloads[0][2]["model"], "grok-imagine-image-3.0")
+        self.assertTrue(image)
 
 
 class GrokFallbackTests(unittest.IsolatedAsyncioTestCase):

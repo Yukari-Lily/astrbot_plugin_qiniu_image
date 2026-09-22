@@ -16,8 +16,9 @@ class ModelOutputError(ValueError):
     """结果不可执行；错误说明可安全反馈给模型，便于下一次修正。"""
 
 
-# 只认句首的对话式拒答：改写结果要是画面描述，句中出现"很高兴""很遗憾"这类字词不能被误伤。
+# 句首的对话式拒答：改写结果要是画面描述，句中出现"很高兴""很遗憾"这类字词不能被误伤。
 # 因此判定的是"第一句是不是以拒答开头"，不是"开头十几个字里有没有这些字样"。
+# "很遗憾""作为一个"这类只可能出现在句首，放全文扫描会误伤画面描述，所以只用于句首。
 _REFUSAL_MARKERS = (
     "抱歉",
     "对不起",
@@ -38,16 +39,44 @@ _REFUSAL_MARKERS = (
     "i can't",
     "as an ai",
 )
+# 无论出现在哪一句都算拒答的措辞：这些是模型在说"我不帮你做这件事"，不是画面描述，
+# 正常改写稿不会出现。只收录第一句没拒答、后面才拒答时也必须拦住的写法，避免误伤正文。
+_REFUSAL_PHRASES = (
+    "我无法",
+    "我不能",
+    "我不会",
+    "无法协助",
+    "不能协助",
+    "无法为你",
+    "不能为你",
+    "无法提供",
+    "不能提供",
+    "作为一个ai",
+    "作为一名ai",
+    "我是一个ai",
+    "我是一个人工智能",
+    "我是一个语言模型",
+    "i'm sorry",
+    "i am sorry",
+    "i cannot",
+    "i can't",
+    "as an ai",
+)
 _SENTENCE_END_RE = re.compile(r"[。！？!?；;\n]")
 _OPENING_PUNCTUATION = "「『“\"'（( 　"
+
 
 def is_prompt_text(text: str) -> bool:
     """判断结果是"一段提示词"还是"模型在回答我们"。
 
-    改写是否保住原意、写得够不够好交给模型自己与逐级重试判断，插件只挡掉句首拒答这类
-    不能送进图片模型的结果。
+    改写是否保住原意、写得够不够好交给模型自己与逐级重试判断，插件只挡掉拒答这类
+    不能送进图片模型的结果。拒答可以只在第一句出现（"无法按你的要求改写……"），也可以
+    先客套一句再拒答（"好的。我不能协助……"），因此除句首外还要扫全文。
     """
     if not text:
+        return False
+    lowered = text.lower()
+    if any(phrase in lowered for phrase in _REFUSAL_PHRASES):
         return False
     opening = _SENTENCE_END_RE.split(text, maxsplit=1)[0].lstrip(_OPENING_PUNCTUATION).lower()
     return not any(opening.startswith(marker) for marker in _REFUSAL_MARKERS)
