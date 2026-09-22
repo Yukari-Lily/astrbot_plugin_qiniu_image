@@ -337,6 +337,14 @@ class PromptTests(unittest.TestCase):
             has_image=has_image, enable_styles=enable_styles,
         )
 
+    def test_instructions_require_faithful_intent_without_preemptive_softening(self):
+        tool_doc = main.QiniuImagePlugin.draw_image.__doc__ or ""
+        self.assertIn("不要替用户预先删减", tool_doc)
+        self.assertIn("软化", tool_doc)
+        self.assertIn("如实写进 prompt", tool_doc)
+        self.assertIn("不得以内容敏感、尺度或平台政策为由删减、软化或概括", optimizer.OPTIMIZER_INSTRUCTION)
+        self.assertIn("安全处理由插件在图片平台审核后负责", optimizer.OPTIMIZER_INSTRUCTION)
+
     def test_empty_style_accepts_existing_design_without_verbatim_evidence(self):
         for reason in ("external", "user_opt_out", "preserve_plan", "incompatible"):
             with self.subTest(reason=reason):
@@ -475,21 +483,47 @@ class GrokFallbackTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.plugin.terminate()
 
-    async def test_grok_levels_2_to_5_use_grok_after_fallback_exhausted(self):
-        self.plugin.client.text_to_image.side_effect = [
-            qiniu.QiniuSafetyError(400, "safety"),
-            qiniu.QiniuSafetyError(400, "safety"),
-        ]
-        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="第二层安全稿")), \
-             patch.object(self.plugin, "_try_grok_fallback", AsyncMock(return_value=None)):
+    async def test_safety_reject_switches_to_grok_before_qiniu_level1(self):
+        self.plugin.client.text_to_image.side_effect = [qiniu.QiniuSafetyError(400, "safety")]
+        levels = []
+
+        async def fake_rewrite(context, umo, prompt, **kwargs):
+            levels.append(kwargs["safety_attempt"])
+            return f"第{kwargs['safety_attempt']}层改写稿"
+
+        with patch.object(main, "rewrite_for_safety", AsyncMock(side_effect=fake_rewrite)), \
+             patch.object(self.plugin, "_try_grok_fallback", AsyncMock(return_value=None)) as fallback:
             result = await self.plugin._run_request(Event(), plans.DrawingRequest(prompt="原稿"))
         self.assertEqual(result[0], "grok-b64")
+        fallback.assert_awaited_once()
+        # 原模型只提交一次，第 1 层不再回七牛；兜底失败后从第 2 层续跑，不重复第 1 层。
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 1)
+        self.assertEqual(levels, [2])
         self.assertEqual(self.plugin.grok_client.generate_image.await_count, 1)
-        self.assertEqual(self.plugin.client.text_to_image.await_count, 2)
         submitted = self.plugin.grok_client.generate_image.await_args.args[0]
-        self.assertTrue(submitted.startswith("第二层安全稿"))
+        self.assertTrue(submitted.startswith("第2层改写稿"))
 
-    async def test_without_grok_level_2_stays_on_qiniu(self):
+    async def test_grok_fallback_exhausted_resumes_at_level_2_without_repeat(self):
+        # 真实兜底：Grok 两次都失败后，第 1 层改写稿只能提交一次，随后从第 2 层续跑。
+        self.plugin.client.text_to_image.side_effect = qiniu.QiniuSafetyError(400, "safety")
+        self.plugin.grok_client.generate_image = AsyncMock(side_effect=RuntimeError("grok down"))
+        levels = []
+
+        async def fake_rewrite(context, umo, prompt, **kwargs):
+            levels.append(kwargs["safety_attempt"])
+            return f"第{kwargs['safety_attempt']}层改写稿"
+
+        with patch.object(main, "rewrite_for_safety", AsyncMock(side_effect=fake_rewrite)):
+            result = await self.plugin._run_request(Event(), plans.DrawingRequest(prompt="原稿"))
+        self.assertIsNone(result[0])
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 1)
+        self.assertEqual(levels, [1, 2, 3, 4, 5])
+        submitted = [call.args[0] for call in self.plugin.grok_client.generate_image.await_args_list]
+        self.assertEqual(submitted, [
+            "一只猫", "第1层改写稿", "第2层改写稿", "第3层改写稿", "第4层改写稿", "第5层改写稿",
+        ])
+
+    async def test_without_grok_level_1_stays_on_qiniu(self):
         self.plugin.grok_client.api_base = ""
         self.plugin.grok_client.generate_image.reset_mock()
         self.plugin.client.text_to_image.side_effect = [
@@ -497,10 +531,11 @@ class GrokFallbackTests(unittest.IsolatedAsyncioTestCase):
             qiniu.QiniuSafetyError(400, "safety"),
             ["qiniu-ok"],
         ]
-        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="第二层安全稿")), \
-             patch.object(self.plugin, "_try_grok_fallback", AsyncMock(return_value=None)):
+        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="第一层安全稿")), \
+             patch.object(self.plugin, "_try_grok_fallback", AsyncMock(return_value=None)) as fallback:
             result = await self.plugin._run_request(Event(), plans.DrawingRequest(prompt="原稿"))
         self.assertEqual(result[0], "qiniu-ok")
+        fallback.assert_not_awaited()
         self.plugin.grok_client.generate_image.assert_not_awaited()
         self.assertEqual(self.plugin.client.text_to_image.await_count, 3)
 
