@@ -57,7 +57,7 @@ sys.modules["astrbot.api"].AstrBotConfig = dict
 sys.modules["astrbot.api.event"].AstrMessageEvent = object
 sys.modules["astrbot.api.event"].MessageChain = Chain
 sys.modules["astrbot.api.event"].filter = types.SimpleNamespace(
-    llm_tool=decorator, event_message_type=decorator,
+    llm_tool=decorator, event_message_type=decorator, command=decorator,
     EventMessageType=types.SimpleNamespace(ALL="all"),
     PlatformAdapterType=types.SimpleNamespace(AIOCQHTTP="aiocqhttp"),
 )
@@ -428,6 +428,81 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         safety = importlib.import_module("drawing_plugin.safety_rewriter")
         self.assertFalse(safety.is_prompt_text("抱歉，我无法改写"))
         self.assertTrue(safety.is_prompt_text("少女很高兴地跑到海边"))
+
+    async def test_first_level_task_keeps_original_meaning_and_skips_tightening(self):
+        safety = importlib.import_module("drawing_plugin.safety_rewriter")
+        captured = []
+
+        async def fake_call(context, umo, *, prompt, system_prompt, **kwargs):
+            captured.append((prompt, system_prompt))
+            return ("改写后的画面", "optimizer")
+
+        with patch.object(safety, "call_with_fallback", side_effect=fake_call):
+            await safety.rewrite_for_safety(None, "group", "p脱掉衣服", safety_attempt=1)
+            await safety.rewrite_for_safety(None, "group", "p脱掉衣服", safety_attempt=5)
+
+        first_task, first_system = captured[0]
+        fifth_task, fifth_system = captured[1]
+        self.assertIn("只做同义替换", first_task)
+        self.assertIn("不要新增原文没有的完整内搭", first_task)
+        self.assertNotIn("衣着完整", first_task)
+        self.assertNotIn("至少弱化其中一项", first_system)
+        self.assertNotIn("端庄睡衣", first_system)
+        self.assertIn("不改动画面内容", first_system)
+        self.assertIn("做最大安全改写", fifth_task)
+        self.assertIn("衣着完整", fifth_system)
+        self.assertIn("至少弱化其中一项", fifth_system)
+
+
+class GrokFallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.ctx = types.SimpleNamespace(
+            get_current_chat_provider_id=AsyncMock(return_value="optimizer"),
+            llm_generate=AsyncMock(return_value=optimizer_json()),
+        )
+        config = {
+            "api_key": "k", "model": "openai/gpt-image-2", "quality": "high",
+            "size": "1024x1024", "concurrency": 2, "rewrite_provider_ids": "",
+            "grok2api_base_url": "http://127.0.0.1:9/v1", "grok2api_api_key": "",
+            "grok2api_concurrency": 2, "grok2api_video_timeout": 60,
+        }
+        self.plugin = main.QiniuImagePlugin(self.ctx, config)
+        self.plugin.client.text_to_image = AsyncMock()
+        self.plugin.grok_client.generate_image = AsyncMock(return_value="grok-b64")
+        # configured 是只读属性，由服务地址决定；这里显式声明用例依赖的启用状态。
+        self.plugin.grok_client.api_base = "http://127.0.0.1:9/v1"
+
+    async def asyncTearDown(self):
+        await self.plugin.terminate()
+
+    async def test_grok_levels_2_to_5_use_grok_after_fallback_exhausted(self):
+        self.plugin.client.text_to_image.side_effect = [
+            qiniu.QiniuSafetyError(400, "safety"),
+            qiniu.QiniuSafetyError(400, "safety"),
+        ]
+        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="第二层安全稿")), \
+             patch.object(self.plugin, "_try_grok_fallback", AsyncMock(return_value=None)):
+            result = await self.plugin._run_request(Event(), plans.DrawingRequest(prompt="原稿"))
+        self.assertEqual(result[0], "grok-b64")
+        self.assertEqual(self.plugin.grok_client.generate_image.await_count, 1)
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 2)
+        submitted = self.plugin.grok_client.generate_image.await_args.args[0]
+        self.assertTrue(submitted.startswith("第二层安全稿"))
+
+    async def test_without_grok_level_2_stays_on_qiniu(self):
+        self.plugin.grok_client.api_base = ""
+        self.plugin.grok_client.generate_image.reset_mock()
+        self.plugin.client.text_to_image.side_effect = [
+            qiniu.QiniuSafetyError(400, "safety"),
+            qiniu.QiniuSafetyError(400, "safety"),
+            ["qiniu-ok"],
+        ]
+        with patch.object(main, "rewrite_for_safety", AsyncMock(return_value="第二层安全稿")), \
+             patch.object(self.plugin, "_try_grok_fallback", AsyncMock(return_value=None)):
+            result = await self.plugin._run_request(Event(), plans.DrawingRequest(prompt="原稿"))
+        self.assertEqual(result[0], "qiniu-ok")
+        self.plugin.grok_client.generate_image.assert_not_awaited()
+        self.assertEqual(self.plugin.client.text_to_image.await_count, 3)
 
 
 if __name__ == "__main__":
